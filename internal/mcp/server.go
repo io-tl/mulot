@@ -13,6 +13,7 @@ import (
 	"github.com/io-tl/mulot/internal/browser"
 	"github.com/io-tl/mulot/internal/dom"
 	"github.com/io-tl/mulot/internal/httpx"
+	"github.com/io-tl/mulot/internal/journal"
 	"github.com/io-tl/mulot/internal/js"
 	"github.com/io-tl/mulot/internal/navigation"
 	"github.com/io-tl/mulot/internal/network"
@@ -28,6 +29,7 @@ type session struct {
 	netMon  *network.Monitor
 	console *js.ConsoleCapture
 	dialogs *browser.DialogHandler
+	journal *journal.Journal
 }
 
 func Run() error {
@@ -73,9 +75,10 @@ func registerTools(s *server.MCPServer, sess *session) {
 
 	s.AddTool(
 		mcp.NewTool("browser_launch",
-			mcp.WithDescription("Start a Chromium browser. MUST be called before any other browser_ tool. Auto-starts network/console/dialog monitoring. Calling again closes the previous instance."),
+			mcp.WithDescription("Start a Chromium browser. MUST be called before any other browser_ tool. Auto-starts network/console/dialog monitoring and the always-on HTTP traffic journal (SQLite). Calling again closes the previous instance."),
 			mcp.WithBoolean("headless", mcp.Description("Run without visible UI (default: true). Set false for visual debugging.")),
-			mcp.WithString("proxy", mcp.Description("HTTP/SOCKS5 proxy URL, e.g. 'socks5://127.0.0.1:9050'")),
+			mcp.WithString("proxy", mcp.Description("Upstream HTTP/SOCKS5 proxy to route the browser through, e.g. 'http://127.0.0.1:8080' (Burp) or 'socks5://127.0.0.1:9050' (Tor).")),
+			mcp.WithString("journal_db", mcp.Description("Path to the SQLite traffic journal (default: ~/.mulot/traffic.db). The journal records every request/response automatically.")),
 		),
 		func(ctx context.Context, req mcp.CallToolRequest) (*mcp.CallToolResult, error) {
 			args := req.GetArguments()
@@ -112,7 +115,17 @@ func registerTools(s *server.MCPServer, sess *session) {
 			sess.dialogs = browser.NewDialogHandler("accept")
 			sess.dialogs.Start(tab.Context())
 
-			return mcp.NewToolResultText("Browser launched successfully"), nil
+			dbPath, _ := args["journal_db"].(string)
+			msg := "Browser launched successfully"
+			if jr, err := journal.Open(dbPath); err != nil {
+				msg += fmt.Sprintf(" (traffic journal disabled: %v)", err)
+			} else {
+				jr.Start(tab.Context())
+				sess.journal = jr
+				msg += " — traffic journal at " + jr.Path()
+			}
+
+			return mcp.NewToolResultText(msg), nil
 		},
 	)
 
@@ -133,12 +146,18 @@ func registerTools(s *server.MCPServer, sess *session) {
 			if sess.dialogs != nil {
 				sess.dialogs.Stop()
 			}
+			// Close the journal before the browser so queued body fetches can
+			// still reach the live CDP connection.
+			if sess.journal != nil {
+				sess.journal.Close()
+			}
 			sess.browser.Close()
 			sess.browser = nil
 			sess.tab = nil
 			sess.netMon = nil
 			sess.console = nil
 			sess.dialogs = nil
+			sess.journal = nil
 			return mcp.NewToolResultText("Browser closed"), nil
 		},
 	)
@@ -677,6 +696,163 @@ func registerTools(s *server.MCPServer, sess *session) {
 				return errResult(fmt.Sprintf("request failed: %v", err))
 			}
 			return jsonResult(resp)
+		},
+	)
+
+	// ── Traffic journal (always-on, SQLite) ───────────────────
+
+	s.AddTool(
+		mcp.NewTool("browser_get_traffic",
+			mcp.WithDescription("Query the always-on HTTP traffic journal (every request/response since launch, persisted to SQLite). Returns flow metadata (id, method, url, host, status, mimeType, sizes, timing) — newest first. Use the filters to narrow down, then browser_get_flow_body for a specific body or browser_replay_request to re-issue one. Bodies are stored only for text-like responses."),
+			mcp.WithString("host", mcp.Description("Exact host filter, e.g. 'app.example.com'.")),
+			mcp.WithString("method", mcp.Description("HTTP method filter, e.g. 'POST'.")),
+			mcp.WithNumber("status", mcp.Description("Exact status code, e.g. 200.")),
+			mcp.WithNumber("status_min", mcp.Description("Minimum status code, e.g. 400 to see only errors.")),
+			mcp.WithString("url_contains", mcp.Description("Substring the URL must contain, e.g. '/api/'.")),
+			mcp.WithString("body_contains", mcp.Description("Substring that must appear in a stored request/response body, e.g. a token or error string.")),
+			mcp.WithNumber("since_id", mcp.Description("Only flows with id greater than this (poll for new traffic).")),
+			mcp.WithNumber("limit", mcp.Description("Max rows to return (default 100, max 1000).")),
+		),
+		func(ctx context.Context, req mcp.CallToolRequest) (*mcp.CallToolResult, error) {
+			if sess.journal == nil {
+				return errResult("no traffic journal — call browser_launch first")
+			}
+			args := req.GetArguments()
+			f := journal.Filter{}
+			f.Host, _ = args["host"].(string)
+			f.Method, _ = args["method"].(string)
+			f.URLContains, _ = args["url_contains"].(string)
+			f.BodyContains, _ = args["body_contains"].(string)
+			if v, ok := args["status"].(float64); ok {
+				f.Status = int(v)
+			}
+			if v, ok := args["status_min"].(float64); ok {
+				f.StatusMin = int(v)
+			}
+			if v, ok := args["since_id"].(float64); ok {
+				f.SinceID = int64(v)
+			}
+			if v, ok := args["limit"].(float64); ok {
+				f.Limit = int(v)
+			}
+			flows, err := sess.journal.Query(f)
+			if err != nil {
+				return errResult(fmt.Sprintf("query failed: %v", err))
+			}
+			return jsonResult(flows)
+		},
+	)
+
+	s.AddTool(
+		mcp.NewTool("browser_get_flow_body",
+			mcp.WithDescription("Get the stored request or response body of a journaled flow (by the id from browser_get_traffic). Returns the body text and whether it was truncated. Bodies are only stored for text-like content."),
+			mcp.WithNumber("flow_id", mcp.Required(), mcp.Description("The flow id from browser_get_traffic.")),
+			mcp.WithString("kind", mcp.Description("'response' (default) or 'request'.")),
+		),
+		func(ctx context.Context, req mcp.CallToolRequest) (*mcp.CallToolResult, error) {
+			if sess.journal == nil {
+				return errResult("no traffic journal — call browser_launch first")
+			}
+			args := req.GetArguments()
+			idF, _ := args["flow_id"].(float64)
+			kind, _ := args["kind"].(string)
+			if kind == "" {
+				kind = "response"
+			}
+			body, truncated, err := sess.journal.Body(int64(idF), kind)
+			if err != nil {
+				return errResult(fmt.Sprintf("failed: %v", err))
+			}
+			if body == nil {
+				return jsonResult(map[string]any{"found": false, "kind": kind})
+			}
+			return jsonResult(map[string]any{
+				"found":     true,
+				"kind":      kind,
+				"truncated": truncated,
+				"body":      string(body),
+			})
+		},
+	)
+
+	s.AddTool(
+		mcp.NewTool("browser_replay_request",
+			mcp.WithDescription("Re-issue a captured request (by its journal flow id), optionally overriding parts of it, and return the response. Combines with browser_get_traffic to do Burp-Repeater-style testing: capture a request, then replay it with a tampered id/param/header or different cookies (IDOR, access control, parameter tampering). Carries the browser session by default."),
+			mcp.WithNumber("flow_id", mcp.Required(), mcp.Description("The flow id from browser_get_traffic to replay.")),
+			mcp.WithString("url", mcp.Description("Override the URL (e.g. change an id in the path/query).")),
+			mcp.WithString("method", mcp.Description("Override the HTTP method.")),
+			mcp.WithString("body", mcp.Description("Override the request body.")),
+			mcp.WithObject("headers", mcp.Description("Headers to merge over the captured ones (JSON object).")),
+			mcp.WithObject("cookies", mcp.Description("Explicit cookies to send (JSON object) — e.g. another user's session for IDOR/access-control tests.")),
+			mcp.WithBoolean("use_session", mcp.Description("Also send the browser's current cookies (default: true).")),
+			mcp.WithBoolean("follow_redirects", mcp.Description("Follow 3xx redirects (default: false).")),
+		),
+		func(ctx context.Context, req mcp.CallToolRequest) (*mcp.CallToolResult, error) {
+			if sess.journal == nil {
+				return errResult("no traffic journal — call browser_launch first")
+			}
+			args := req.GetArguments()
+			idF, _ := args["flow_id"].(float64)
+			rd, err := sess.journal.ForReplay(int64(idF))
+			if err != nil {
+				return errResult(fmt.Sprintf("flow %d not found: %v", int64(idF), err))
+			}
+
+			r := httpx.Request{
+				Method:  rd.Method,
+				URL:     rd.URL,
+				Headers: rd.Headers,
+				Body:    rd.Body,
+			}
+			if v, ok := args["url"].(string); ok && v != "" {
+				r.URL = v
+			}
+			if v, ok := args["method"].(string); ok && v != "" {
+				r.Method = v
+			}
+			if v, ok := args["body"].(string); ok {
+				r.Body = v
+			}
+			for k, v := range argStringMap(args["headers"]) {
+				if r.Headers == nil {
+					r.Headers = map[string]string{}
+				}
+				r.Headers[k] = v
+			}
+			if f, ok := args["follow_redirects"].(bool); ok {
+				r.FollowRedirects = f
+			}
+			useSession := true
+			if s, ok := args["use_session"].(bool); ok {
+				useSession = s
+			}
+			if useSession && sess.tab != nil {
+				r.Cookies = append(r.Cookies, sessionCookiesFor(sess.tab.Context(), r.URL)...)
+			}
+			for k, v := range argStringMap(args["cookies"]) {
+				r.Cookies = append(r.Cookies, &http.Cookie{Name: k, Value: v})
+			}
+
+			resp, err := httpx.Send(ctx, r)
+			if err != nil {
+				return errResult(fmt.Sprintf("replay failed: %v", err))
+			}
+			return jsonResult(resp)
+		},
+	)
+
+	s.AddTool(
+		mcp.NewTool("browser_clear_journal",
+			mcp.WithDescription("Delete all recorded flows and bodies from the traffic journal. Use to start a clean capture before a specific test."),
+		),
+		func(ctx context.Context, req mcp.CallToolRequest) (*mcp.CallToolResult, error) {
+			if sess.journal == nil {
+				return errResult("no traffic journal — call browser_launch first")
+			}
+			if err := sess.journal.Clear(); err != nil {
+				return errResult(fmt.Sprintf("clear failed: %v", err))
+			}
+			return mcp.NewToolResultText("Traffic journal cleared"), nil
 		},
 	)
 
