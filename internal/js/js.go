@@ -134,9 +134,17 @@ func (c *ConsoleCapture) Stop() {
 	c.active = false
 }
 
+// awaitPromise makes chromedp await a returned Promise and hand back its
+// resolved value. It is a no-op for non-Promise expressions, so it is safe to
+// always apply — and it is what lets an in-page async fetch loop (concurrent
+// fuzzing/brute-force, returning only the hits) run in a single evaluate call.
+func awaitPromise(p *cdpRuntime.EvaluateParams) *cdpRuntime.EvaluateParams {
+	return p.WithAwaitPromise(true)
+}
+
 func Evaluate(ctx context.Context, expression string) (interface{}, error) {
 	var result interface{}
-	if err := chromedp.Run(ctx, chromedp.Evaluate(expression, &result)); err != nil {
+	if err := chromedp.Run(ctx, chromedp.Evaluate(expression, &result, awaitPromise)); err != nil {
 		return nil, err
 	}
 	return result, nil

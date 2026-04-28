@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"net/http"
 	"reflect"
+	"time"
 
 	"github.com/chromedp/chromedp"
 	"github.com/io-tl/mulot/internal/accessibility"
@@ -591,15 +592,23 @@ func registerTools(s *server.MCPServer, sess *session) {
 
 	s.AddTool(
 		mcp.NewTool("browser_evaluate_js",
-			mcp.WithDescription("Execute JavaScript in the page context and return the result as JSON. Escape hatch for complex interactions: read/write localStorage, call page APIs, manipulate DOM when CSS selectors aren't enough, submit forms programmatically."),
-			mcp.WithString("expression", mcp.Required(), mcp.Description("JavaScript expression to evaluate. Return value is JSON-serialized. Wrap objects in JSON.stringify() for complex data.")),
+			mcp.WithDescription("Execute JavaScript in the page context and return the result as JSON. Awaits Promises, so an async expression resolves before returning — write an `(async()=>{...})()` IIFE that loops in-page with fetch() and Promise.all to brute-force/fuzz at speed in ONE call, returning only the hits (no per-iteration MCP or CDP round-trip). Same-origin fetch automatically carries the session cookies. For cross-origin or forbidden headers (Host, Cookie swap), use browser_http_request instead. Also the escape hatch for localStorage, page APIs, and DOM work CSS selectors can't express."),
+			mcp.WithString("expression", mcp.Required(), mcp.Description("JavaScript expression to evaluate (may be async / return a Promise). Return value is JSON-serialized; keep it small (return only matches/aggregates, not every response).")),
+			mcp.WithNumber("timeout_ms", mcp.Description("Max time to wait for the expression/Promise (default: 30000). Raise it for large in-page fuzz loops.")),
 		),
 		func(ctx context.Context, req mcp.CallToolRequest) (*mcp.CallToolResult, error) {
 			if sess.tab == nil {
 				return errResult("browser not launched")
 			}
-			expr, _ := req.GetArguments()["expression"].(string)
-			result, err := js.Evaluate(sess.tab.Context(), expr)
+			args := req.GetArguments()
+			expr, _ := args["expression"].(string)
+			timeout := 30 * time.Second
+			if t, ok := args["timeout_ms"].(float64); ok && t > 0 {
+				timeout = time.Duration(t) * time.Millisecond
+			}
+			tctx, cancel := context.WithTimeout(sess.tab.Context(), timeout)
+			defer cancel()
+			result, err := js.Evaluate(tctx, expr)
 			if err != nil {
 				return errResult(fmt.Sprintf("JS evaluation failed: %v", err))
 			}
