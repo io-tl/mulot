@@ -470,6 +470,45 @@ func (j *Journal) Flow(id int64) (*FlowDetail, error) {
 	return &d, nil
 }
 
+// ResponseView is a flattened response for passive scanning: URL, status, mime
+// type, response headers (original CDP casing), and the stored response body
+// (text-like only; empty otherwise). Built by Responses in a single query.
+type ResponseView struct {
+	URL         string
+	Status      int
+	MimeType    string
+	RespHeaders map[string]string
+	Body        string
+}
+
+// Responses returns every flow's response for passive analysis, in capture
+// order. One LEFT JOIN against the cold body table, so no N+1 round-trips.
+func (j *Journal) Responses() ([]ResponseView, error) {
+	rows, err := j.db.Query(`SELECT f.url, f.status, f.mime_type, f.resp_headers, b.content
+		FROM flows f LEFT JOIN bodies b ON b.flow_id = f.id AND b.kind = 'response'
+		ORDER BY f.id`)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+
+	var out []ResponseView
+	for rows.Next() {
+		var rv ResponseView
+		var headersJSON sql.NullString
+		var content []byte
+		if err := rows.Scan(&rv.URL, &rv.Status, &rv.MimeType, &headersJSON, &content); err != nil {
+			return nil, err
+		}
+		if headersJSON.Valid && headersJSON.String != "" {
+			json.Unmarshal([]byte(headersJSON.String), &rv.RespHeaders)
+		}
+		rv.Body = string(content)
+		out = append(out, rv)
+	}
+	return out, rows.Err()
+}
+
 // ReplayData holds what is needed to re-issue a captured request.
 type ReplayData struct {
 	Method  string
