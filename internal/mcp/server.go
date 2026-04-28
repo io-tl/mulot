@@ -9,10 +9,10 @@ import (
 	"time"
 
 	"github.com/chromedp/chromedp"
-	"github.com/io-tl/mulot/internal/accessibility"
 	"github.com/io-tl/mulot/internal/auth"
 	"github.com/io-tl/mulot/internal/browser"
 	"github.com/io-tl/mulot/internal/dom"
+	"github.com/io-tl/mulot/internal/fuzz"
 	"github.com/io-tl/mulot/internal/httpx"
 	"github.com/io-tl/mulot/internal/journal"
 	"github.com/io-tl/mulot/internal/js"
@@ -68,6 +68,64 @@ func errResult(msg string) (*mcp.CallToolResult, error) {
 		},
 		IsError: true,
 	}, nil
+}
+
+// buildBaseRequest assembles an httpx.Request from tool arguments, shared by
+// http_request and http_fuzz. An optional from_flow seeds method/url/headers/body
+// from a journaled exchange; explicit fields then OVERRIDE the flow (fields win
+// over flow). Session cookies are added unless use_session=false.
+func buildBaseRequest(sess *session, args map[string]any) (httpx.Request, error) {
+	var r httpx.Request
+
+	if f, ok := args["from_flow"].(float64); ok && f != 0 {
+		if sess.journal == nil {
+			return r, fmt.Errorf("no traffic journal — call browser_launch first")
+		}
+		rd, err := sess.journal.ForReplay(int64(f))
+		if err != nil {
+			return r, fmt.Errorf("flow %d not found: %v", int64(f), err)
+		}
+		r.Method, r.URL, r.Headers, r.Body = rd.Method, rd.URL, rd.Headers, rd.Body
+	}
+
+	// Explicit fields override the flow base.
+	if v, ok := args["url"].(string); ok && v != "" {
+		r.URL = v
+	}
+	if v, ok := args["method"].(string); ok && v != "" {
+		r.Method = v
+	}
+	if v, ok := args["body"].(string); ok {
+		r.Body = v
+	}
+	for k, v := range argStringMap(args["headers"]) {
+		if r.Headers == nil {
+			r.Headers = map[string]string{}
+		}
+		r.Headers[k] = v
+	}
+	if f, ok := args["follow_redirects"].(bool); ok {
+		r.FollowRedirects = f
+	}
+	if t, ok := args["timeout_ms"].(float64); ok {
+		r.TimeoutMs = int(t)
+	}
+
+	if r.URL == "" {
+		return r, fmt.Errorf("url is required (or a valid from_flow)")
+	}
+
+	useSession := true
+	if s, ok := args["use_session"].(bool); ok {
+		useSession = s
+	}
+	if useSession && sess.tab != nil {
+		r.Cookies = append(r.Cookies, sessionCookiesFor(sess.tab.Context(), r.URL)...)
+	}
+	for k, v := range argStringMap(args["cookies"]) {
+		r.Cookies = append(r.Cookies, &http.Cookie{Name: k, Value: v})
+	}
+	return r, nil
 }
 
 func registerTools(s *server.MCPServer, sess *session) {
@@ -367,32 +425,6 @@ func registerTools(s *server.MCPServer, sess *session) {
 	)
 
 	s.AddTool(
-		mcp.NewTool("browser_get_accessibility_tree",
-			mcp.WithDescription("Get the full accessibility tree with all DOM nodes, optionally filtered by ARIA roles. More detailed than browser_snapshot but much more verbose. Use when you need the complete tree hierarchy or filtering by specific roles."),
-			mcp.WithString("roles", mcp.Description("Comma-separated ARIA roles to keep, e.g. 'button,link,textbox,heading'. Omit for the entire unfiltered tree.")),
-		),
-		func(ctx context.Context, req mcp.CallToolRequest) (*mcp.CallToolResult, error) {
-			if sess.tab == nil {
-				return errResult("browser not launched")
-			}
-			rolesStr, _ := req.GetArguments()["roles"].(string)
-			if rolesStr != "" {
-				roles := splitCSV(rolesStr)
-				tree, err := accessibility.GetTreeFiltered(sess.tab.Context(), roles)
-				if err != nil {
-					return errResult(fmt.Sprintf("failed: %v", err))
-				}
-				return jsonResult(tree)
-			}
-			tree, err := accessibility.GetTree(sess.tab.Context())
-			if err != nil {
-				return errResult(fmt.Sprintf("failed: %v", err))
-			}
-			return jsonResult(tree)
-		},
-	)
-
-	s.AddTool(
 		mcp.NewTool("browser_query_dom",
 			mcp.WithDescription("Query DOM elements by CSS selector. Returns each match's tag, id, classes, all attributes, textContent, visibility, and bounding box. Best tool for inspecting specific elements or discovering the exact CSS selector to pass to browser_click/browser_type."),
 			mcp.WithString("selector", mcp.Required(), mcp.Description("CSS selector, e.g. 'button', '.modal input', 'a[href*=\"login\"]', '#search-form *'")),
@@ -592,7 +624,7 @@ func registerTools(s *server.MCPServer, sess *session) {
 
 	s.AddTool(
 		mcp.NewTool("browser_evaluate_js",
-			mcp.WithDescription("Execute JavaScript in the page context and return the result as JSON. Awaits Promises, so an async expression resolves before returning — write an `(async()=>{...})()` IIFE that loops in-page with fetch() and Promise.all to brute-force/fuzz at speed in ONE call, returning only the hits (no per-iteration MCP or CDP round-trip). Same-origin fetch automatically carries the session cookies. For cross-origin or forbidden headers (Host, Cookie swap), use browser_http_request instead. Also the escape hatch for localStorage, page APIs, and DOM work CSS selectors can't express."),
+			mcp.WithDescription("Execute JavaScript in the page context (V8) and return the result as JSON. Awaits Promises, so an async expression resolves before returning — write an `(async()=>{...})()` IIFE that loops in-page with fetch() and Promise.all to brute-force/fuzz at speed in ONE call, returning only the hits (no per-iteration MCP or CDP round-trip). Same-origin fetch automatically carries the session cookies. For cross-origin or forbidden headers (Host, Cookie swap), use http_request instead.\n\nThis is also the universal ENCODER/DECODER/CRYPTO (it replaces a fixed decoder menu): base64 atob/btoa, URL encode/decodeURIComponent, hex/bytes via Uint8Array & TextEncoder, JWT (split on '.' then atob), and `await crypto.subtle` for SHA/HMAC/AES. atob/btoa are latin1, so for raw bytes use this helper:\n  const b2h=u=>[...u].map(b=>b.toString(16).padStart(2,'0')).join(''), h2b=h=>new Uint8Array(h.match(/../g).map(x=>parseInt(x,16))), b2b64=u=>btoa(String.fromCharCode(...u)), b642b=s=>Uint8Array.from(atob(s),c=>c.charCodeAt(0));\nNote: crypto.subtle is undefined outside a secure context (an http:// non-localhost page), so pure byte math (XOR, padding-oracle forging) works anywhere but local hashing/AES needs a secure context (e.g. evaluate on about:blank). Also the escape hatch for localStorage, page APIs, and DOM work CSS selectors can't express."),
 			mcp.WithString("expression", mcp.Required(), mcp.Description("JavaScript expression to evaluate (may be async / return a Promise). Return value is JSON-serialized; keep it small (return only matches/aggregates, not every response).")),
 			mcp.WithNumber("timeout_ms", mcp.Description("Max time to wait for the expression/Promise (default: 30000). Raise it for large in-page fuzz loops.")),
 		),
@@ -635,35 +667,15 @@ func registerTools(s *server.MCPServer, sess *session) {
 		},
 	)
 
-	s.AddTool(
-		mcp.NewTool("browser_get_network_logs",
-			mcp.WithDescription("Get HTTP request/response traffic captured since browser launch. Each entry has url, method, status, headers, and bodySize. Use to verify API calls were made, debug auth issues (look for 401s), or inspect headers."),
-			mcp.WithString("method", mcp.Description("Filter by HTTP method: 'GET', 'POST', 'PUT', 'DELETE'. Omit for all traffic.")),
-			mcp.WithBoolean("failed_only", mcp.Description("Show only failed requests (status >= 400). Quick way to check for errors.")),
-		),
-		func(ctx context.Context, req mcp.CallToolRequest) (*mcp.CallToolResult, error) {
-			if sess.netMon == nil {
-				return errResult("browser not launched")
-			}
-			args := req.GetArguments()
-			if failedOnly, ok := args["failed_only"].(bool); ok && failedOnly {
-				return jsonResult(sess.netMon.GetFailedEntries())
-			}
-			if method, ok := args["method"].(string); ok && method != "" {
-				return jsonResult(sess.netMon.GetEntriesByMethod(method))
-			}
-			return jsonResult(sess.netMon.GetEntries())
-		},
-	)
-
 	// ── Raw HTTP (the generic pentest primitive) ───────────────
 
 	s.AddTool(
-		mcp.NewTool("browser_http_request",
-			mcp.WithDescription("Send a raw HTTP request and return the full response (status, headers, set-cookie, body) — a Burp-Repeater primitive. Runs OUTSIDE the browser's CORS/same-origin rules, so you get full control over method, headers, and body, and you read any response. By default it carries the browser's current session cookies (use_session) and does NOT follow redirects (so you see 3xx + Location). Compose it to test IDOR (change an id, swap cookies), access control (replay an admin request as a low-priv user), CORS (set Origin, read Access-Control-Allow-Origin), SSRF (submit an internal URL, observe), JWT/auth tampering, forced browsing, and HTTP method abuse. The model supplies the methodology; this tool is the mechanism."),
-			mcp.WithString("url", mcp.Required(), mcp.Description("Full target URL, e.g. 'http://localhost:4280/vulnerabilities/sqli/?id=1'")),
+		mcp.NewTool("http_request",
+			mcp.WithDescription("Send a raw HTTP request and return the full response (status, headers, set-cookie, body) — the Burp-Repeater primitive. Runs OUTSIDE the browser's CORS/same-origin rules, so you get full control over method, headers, and body, and you read any response. Build it from scratch (url) OR seed it from a captured exchange (from_flow, from http_history) and override parts — explicit fields win over the flow. By default it carries the browser's current session cookies (use_session) and does NOT follow redirects (so you see 3xx + Location). Compose it to test IDOR (change an id, swap cookies), access control (replay an admin request as a low-priv user), CORS (set Origin, read Access-Control-Allow-Origin), SSRF (submit an internal URL, observe), JWT/auth tampering, forced browsing, and HTTP method abuse. The model supplies the methodology; this tool is the mechanism."),
+			mcp.WithString("url", mcp.Description("Full target URL, e.g. 'http://localhost:4280/vulnerabilities/sqli/?id=1'. Required unless from_flow is given.")),
+			mcp.WithNumber("from_flow", mcp.Description("Seed the request from a captured exchange (the id from http_history). Other fields override it.")),
 			mcp.WithString("method", mcp.Description("HTTP method (default GET): GET, POST, PUT, DELETE, PATCH, OPTIONS, HEAD...")),
-			mcp.WithObject("headers", mcp.Description("Request headers as a JSON object, e.g. {\"Origin\":\"https://evil.com\",\"X-Forwarded-For\":\"127.0.0.1\"}.")),
+			mcp.WithObject("headers", mcp.Description("Request headers as a JSON object, e.g. {\"Origin\":\"https://evil.com\",\"X-Forwarded-For\":\"127.0.0.1\"}. Merged over the flow's headers when from_flow is used.")),
 			mcp.WithString("body", mcp.Description("Raw request body (set Content-Type via headers), e.g. 'username=admin&password=x'.")),
 			mcp.WithObject("cookies", mcp.Description("Explicit cookies to send as a JSON object {name: value}. Use to replay as another identity/role (combine with use_session=false).")),
 			mcp.WithBoolean("use_session", mcp.Description("Also send the browser's current cookies for this host (default: true). Set false to send an unauthenticated or fully custom request.")),
@@ -671,35 +683,10 @@ func registerTools(s *server.MCPServer, sess *session) {
 			mcp.WithNumber("timeout_ms", mcp.Description("Request timeout in milliseconds (default: 15000).")),
 		),
 		func(ctx context.Context, req mcp.CallToolRequest) (*mcp.CallToolResult, error) {
-			args := req.GetArguments()
-			rawURL, _ := args["url"].(string)
-			if rawURL == "" {
-				return errResult("url is required")
+			r, err := buildBaseRequest(sess, req.GetArguments())
+			if err != nil {
+				return errResult(err.Error())
 			}
-			r := httpx.Request{
-				URL:     rawURL,
-				Headers: argStringMap(args["headers"]),
-			}
-			r.Method, _ = args["method"].(string)
-			r.Body, _ = args["body"].(string)
-			if f, ok := args["follow_redirects"].(bool); ok {
-				r.FollowRedirects = f
-			}
-			if t, ok := args["timeout_ms"].(float64); ok {
-				r.TimeoutMs = int(t)
-			}
-
-			useSession := true
-			if s, ok := args["use_session"].(bool); ok {
-				useSession = s
-			}
-			if useSession && sess.tab != nil {
-				r.Cookies = append(r.Cookies, sessionCookiesFor(sess.tab.Context(), rawURL)...)
-			}
-			for k, v := range argStringMap(args["cookies"]) {
-				r.Cookies = append(r.Cookies, &http.Cookie{Name: k, Value: v})
-			}
-
 			resp, err := httpx.Send(ctx, r)
 			if err != nil {
 				return errResult(fmt.Sprintf("request failed: %v", err))
@@ -708,11 +695,56 @@ func registerTools(s *server.MCPServer, sess *session) {
 		},
 	)
 
+	// ── Fuzzing (Burp-Intruder "sniper") ───────────────────────
+
+	s.AddTool(
+		mcp.NewTool("http_fuzz",
+			mcp.WithDescription("Burp-Intruder 'sniper': take a base request containing a marker token (default 'FUZZ'), substitute each payload in turn, send it (outside CORS), and return one row per payload {payload, status, length, timeMs, matched}. The marker is replaced in the URL, body, header values, and cookie values. Build the base from scratch (url) or from a captured exchange (from_flow). Use it to generalize what you'd do one-by-one in http_request: SQLi (error and boolean-blind via length/status deltas), forced browsing / directory & file discovery, parameter and value fuzzing, brute force. Supply match_status/match_regex to flag hits; otherwise read the status/length columns yourself to spot anomalies. Sequential, single marker, max 500 payloads per call (split into batches beyond that). For DOM-XSS execution proof use scan_xss instead — this tool only sees raw HTTP."),
+			mcp.WithArray("payloads", mcp.Required(), mcp.Description("Payload values to substitute for the marker, e.g. [\"1' AND '1'='1\",\"1' AND '1'='2\"] or a wordlist of paths. Max 500."), mcp.Items(map[string]any{"type": "string"})),
+			mcp.WithString("marker", mcp.Description("Token replaced by each payload (default 'FUZZ'). Place it where you want to inject, e.g. url '.../?id=FUZZ'.")),
+			mcp.WithString("url", mcp.Description("Base URL containing the marker, e.g. 'http://host/?id=FUZZ'. Required unless from_flow is given.")),
+			mcp.WithNumber("from_flow", mcp.Description("Seed the base request from a captured exchange (id from http_history); put the marker in an overridden field.")),
+			mcp.WithString("method", mcp.Description("HTTP method (default GET).")),
+			mcp.WithObject("headers", mcp.Description("Base request headers (JSON object). The marker is substituted in header values.")),
+			mcp.WithString("body", mcp.Description("Base request body; put the marker here to fuzz a POST parameter, e.g. 'user=admin&pass=FUZZ'.")),
+			mcp.WithObject("cookies", mcp.Description("Explicit cookies (JSON object); the marker is substituted in cookie values.")),
+			mcp.WithBoolean("use_session", mcp.Description("Also send the browser's current cookies (default: true).")),
+			mcp.WithBoolean("follow_redirects", mcp.Description("Follow 3xx redirects (default: false).")),
+			mcp.WithNumber("match_status", mcp.Description("Flag rows whose response status equals this, e.g. 200 for forced browsing.")),
+			mcp.WithString("match_regex", mcp.Description("Flag rows whose response body matches this regular expression, e.g. 'SQL syntax|PDOException'.")),
+		),
+		func(ctx context.Context, req mcp.CallToolRequest) (*mcp.CallToolResult, error) {
+			args := req.GetArguments()
+			r, err := buildBaseRequest(sess, args)
+			if err != nil {
+				return errResult(err.Error())
+			}
+			p := fuzz.Params{Base: r}
+			p.Marker, _ = args["marker"].(string)
+			p.MatchRegex, _ = args["match_regex"].(string)
+			if v, ok := args["match_status"].(float64); ok {
+				p.MatchStatus = int(v)
+			}
+			if raw, ok := args["payloads"].([]any); ok {
+				for _, pv := range raw {
+					if s, ok := pv.(string); ok {
+						p.Payloads = append(p.Payloads, s)
+					}
+				}
+			}
+			out, err := fuzz.Run(ctx, p)
+			if err != nil {
+				return errResult(fmt.Sprintf("fuzz failed: %v", err))
+			}
+			return jsonResult(out)
+		},
+	)
+
 	// ── Traffic journal (always-on, SQLite) ───────────────────
 
 	s.AddTool(
-		mcp.NewTool("browser_get_traffic",
-			mcp.WithDescription("Query the always-on HTTP traffic journal (every request/response since launch, persisted to SQLite). Returns flow metadata (id, method, url, host, status, mimeType, sizes, timing) — newest first. Use the filters to narrow down, then browser_get_flow_body for a specific body or browser_replay_request to re-issue one. Bodies are stored only for text-like responses."),
+		mcp.NewTool("http_history",
+			mcp.WithDescription("Query the always-on HTTP traffic journal (every request/response since launch, persisted to SQLite) — the Burp Proxy history. Returns flow metadata (id, method, url, host, status, mimeType, sizes, timing) — newest first. Use the filters to narrow down, then http_flow_body for a specific body, http_flow for headers, or http_request/http_fuzz with from_flow to re-issue one. Bodies are stored only for text-like responses."),
 			mcp.WithString("host", mcp.Description("Exact host filter, e.g. 'app.example.com'.")),
 			mcp.WithString("method", mcp.Description("HTTP method filter, e.g. 'POST'.")),
 			mcp.WithNumber("status", mcp.Description("Exact status code, e.g. 200.")),
@@ -753,9 +785,9 @@ func registerTools(s *server.MCPServer, sess *session) {
 	)
 
 	s.AddTool(
-		mcp.NewTool("browser_get_flow_body",
-			mcp.WithDescription("Get the stored request or response body of a journaled flow (by the id from browser_get_traffic). Returns the body text and whether it was truncated. Bodies are only stored for text-like content."),
-			mcp.WithNumber("flow_id", mcp.Required(), mcp.Description("The flow id from browser_get_traffic.")),
+		mcp.NewTool("http_flow_body",
+			mcp.WithDescription("Get the stored request or response body of a journaled flow (by the id from http_history). Returns the body text and whether it was truncated. Bodies are only stored for text-like content."),
+			mcp.WithNumber("flow_id", mcp.Required(), mcp.Description("The flow id from http_history.")),
 			mcp.WithString("kind", mcp.Description("'response' (default) or 'request'.")),
 		),
 		func(ctx context.Context, req mcp.CallToolRequest) (*mcp.CallToolResult, error) {
@@ -785,9 +817,9 @@ func registerTools(s *server.MCPServer, sess *session) {
 	)
 
 	s.AddTool(
-		mcp.NewTool("browser_get_flow",
-			mcp.WithDescription("Get a journaled exchange (by the id from browser_get_traffic) WITH its request and response headers. This is how you read a header the browser saw but doesn't expose to JS — the Location of a 3xx redirect (e.g. an encrypted token passed in a redirect), Set-Cookie, WWW-Authenticate, CSP, or any custom header — without re-issuing the request. Redirect hops are recorded as their own flows, so filter browser_get_traffic by status (301/302) to find them."),
-			mcp.WithNumber("flow_id", mcp.Required(), mcp.Description("The flow id from browser_get_traffic.")),
+		mcp.NewTool("http_flow",
+			mcp.WithDescription("Get a journaled exchange (by the id from http_history) WITH its request and response headers. This is how you read a header the browser saw but doesn't expose to JS — the Location of a 3xx redirect (e.g. an encrypted token passed in a redirect), Set-Cookie, WWW-Authenticate, CSP, or any custom header — without re-issuing the request. Redirect hops are recorded as their own flows, so filter http_history by status (301/302) to find them."),
+			mcp.WithNumber("flow_id", mcp.Required(), mcp.Description("The flow id from http_history.")),
 		),
 		func(ctx context.Context, req mcp.CallToolRequest) (*mcp.CallToolResult, error) {
 			if sess.journal == nil {
@@ -806,73 +838,7 @@ func registerTools(s *server.MCPServer, sess *session) {
 	)
 
 	s.AddTool(
-		mcp.NewTool("browser_replay_request",
-			mcp.WithDescription("Re-issue a captured request (by its journal flow id), optionally overriding parts of it, and return the response. Combines with browser_get_traffic to do Burp-Repeater-style testing: capture a request, then replay it with a tampered id/param/header or different cookies (IDOR, access control, parameter tampering). Carries the browser session by default."),
-			mcp.WithNumber("flow_id", mcp.Required(), mcp.Description("The flow id from browser_get_traffic to replay.")),
-			mcp.WithString("url", mcp.Description("Override the URL (e.g. change an id in the path/query).")),
-			mcp.WithString("method", mcp.Description("Override the HTTP method.")),
-			mcp.WithString("body", mcp.Description("Override the request body.")),
-			mcp.WithObject("headers", mcp.Description("Headers to merge over the captured ones (JSON object).")),
-			mcp.WithObject("cookies", mcp.Description("Explicit cookies to send (JSON object) — e.g. another user's session for IDOR/access-control tests.")),
-			mcp.WithBoolean("use_session", mcp.Description("Also send the browser's current cookies (default: true).")),
-			mcp.WithBoolean("follow_redirects", mcp.Description("Follow 3xx redirects (default: false).")),
-		),
-		func(ctx context.Context, req mcp.CallToolRequest) (*mcp.CallToolResult, error) {
-			if sess.journal == nil {
-				return errResult("no traffic journal — call browser_launch first")
-			}
-			args := req.GetArguments()
-			idF, _ := args["flow_id"].(float64)
-			rd, err := sess.journal.ForReplay(int64(idF))
-			if err != nil {
-				return errResult(fmt.Sprintf("flow %d not found: %v", int64(idF), err))
-			}
-
-			r := httpx.Request{
-				Method:  rd.Method,
-				URL:     rd.URL,
-				Headers: rd.Headers,
-				Body:    rd.Body,
-			}
-			if v, ok := args["url"].(string); ok && v != "" {
-				r.URL = v
-			}
-			if v, ok := args["method"].(string); ok && v != "" {
-				r.Method = v
-			}
-			if v, ok := args["body"].(string); ok {
-				r.Body = v
-			}
-			for k, v := range argStringMap(args["headers"]) {
-				if r.Headers == nil {
-					r.Headers = map[string]string{}
-				}
-				r.Headers[k] = v
-			}
-			if f, ok := args["follow_redirects"].(bool); ok {
-				r.FollowRedirects = f
-			}
-			useSession := true
-			if s, ok := args["use_session"].(bool); ok {
-				useSession = s
-			}
-			if useSession && sess.tab != nil {
-				r.Cookies = append(r.Cookies, sessionCookiesFor(sess.tab.Context(), r.URL)...)
-			}
-			for k, v := range argStringMap(args["cookies"]) {
-				r.Cookies = append(r.Cookies, &http.Cookie{Name: k, Value: v})
-			}
-
-			resp, err := httpx.Send(ctx, r)
-			if err != nil {
-				return errResult(fmt.Sprintf("replay failed: %v", err))
-			}
-			return jsonResult(resp)
-		},
-	)
-
-	s.AddTool(
-		mcp.NewTool("browser_clear_journal",
+		mcp.NewTool("http_clear",
 			mcp.WithDescription("Delete all recorded flows and bodies from the traffic journal. Use to start a clean capture before a specific test."),
 		),
 		func(ctx context.Context, req mcp.CallToolRequest) (*mcp.CallToolResult, error) {
@@ -1001,7 +967,7 @@ func registerTools(s *server.MCPServer, sess *session) {
 	// ── Security Testing ───────────────────────────────────────
 
 	s.AddTool(
-		mcp.NewTool("browser_test_login",
+		mcp.NewTool("scan_login",
 			mcp.WithDescription("Automated login flow: navigates, fills username/password, submits, waits for the page to settle, then judges the outcome. Returns {success, confidence, reason, finalUrl, cookies, ...}. Success detection without indicators combines several signals (login form gone, not back on a login URL, a session cookie established/rotated or a logout link present, no failure message) — a bare redirect is NOT treated as success. For reliable verdicts pass success_indicator or failure_indicator. When confidence is 'low', verify manually. Use browser_get_form_fields first to find selectors."),
 			mcp.WithString("url", mcp.Required(), mcp.Description("Login page URL, e.g. 'https://app.example.com/login'")),
 			mcp.WithString("username_selector", mcp.Required(), mcp.Description("CSS selector for username/email field, e.g. 'input[name=\"email\"]'")),
@@ -1044,41 +1010,58 @@ func registerTools(s *server.MCPServer, sess *session) {
 	)
 
 	s.AddTool(
-		mcp.NewTool("browser_audit_security_headers",
-			mcp.WithDescription("Analyze HTTP responses captured since browser launch for missing or weak security headers: Content-Security-Policy, Strict-Transport-Security, X-Frame-Options, X-Content-Type-Options, Referrer-Policy, Permissions-Policy. Reports severity and recommendations."),
-		),
-		func(ctx context.Context, req mcp.CallToolRequest) (*mcp.CallToolResult, error) {
-			if sess.netMon == nil {
-				return errResult("browser not launched")
-			}
-			audits := security.AuditSecurityHeaders(sess.netMon.GetEntries())
-			return jsonResult(audits)
-		},
-	)
-
-	s.AddTool(
-		mcp.NewTool("browser_scan_secrets",
-			mcp.WithDescription("Scan page HTML for exposed secrets: API keys, auth tokens, private keys, passwords in comments, data attributes, or inline scripts. Optionally also scans HTTP response bodies."),
-			mcp.WithBoolean("include_network", mcp.Description("Also scan HTTP response bodies for secrets (default: false). More thorough but slower.")),
+		mcp.NewTool("scan_passive",
+			mcp.WithDescription("Passive security scan (Burp passive-scanner style), read-only — run after browsing the app. Aggregates three checks and returns {headers, secrets, js}: (1) headers — audits all journaled responses for missing/weak security headers (Content-Security-Policy, Strict-Transport-Security, X-Frame-Options, X-Content-Type-Options, Referrer-Policy, Permissions-Policy...); (2) secrets — scans the current page DOM for exposed API keys/tokens/passwords, and with include_network also the journaled JSON/JS response bodies; (3) js — static analysis of page JavaScript for dangerous sinks (eval, innerHTML, document.write, postMessage without origin check, unsafe-eval in CSP)."),
+			mcp.WithBoolean("include_network", mcp.Description("Also scan journaled response bodies for secrets (default: false). More thorough but slower.")),
 		),
 		func(ctx context.Context, req mcp.CallToolRequest) (*mcp.CallToolResult, error) {
 			if sess.tab == nil {
 				return errResult("browser not launched")
 			}
-			findings, err := security.ScanForSecrets(sess.tab.Context())
+
+			var views []journal.ResponseView
+			if sess.journal != nil {
+				v, err := sess.journal.Responses()
+				if err != nil {
+					return errResult(fmt.Sprintf("journal read failed: %v", err))
+				}
+				views = v
+			}
+
+			headers := security.AuditSecurityHeaders(views)
+			if headers == nil {
+				headers = []security.HeaderAudit{}
+			}
+
+			secrets, err := security.ScanForSecrets(sess.tab.Context())
 			if err != nil {
-				return errResult(fmt.Sprintf("scan failed: %v", err))
+				return errResult(fmt.Sprintf("secret scan failed: %v", err))
 			}
-			if incNet, ok := req.GetArguments()["include_network"].(bool); ok && incNet && sess.netMon != nil {
-				netFindings := security.ScanForSecretsInNetwork(sess.netMon.GetEntries(), sess.tab.Context())
-				findings = append(findings, netFindings...)
+			if incNet, ok := req.GetArguments()["include_network"].(bool); ok && incNet {
+				secrets = append(secrets, security.ScanForSecretsInNetwork(views)...)
 			}
-			return jsonResult(findings)
+			if secrets == nil {
+				secrets = []security.Finding{}
+			}
+
+			jsFindings, err := security.AuditJavaScript(sess.tab.Context())
+			if err != nil {
+				return errResult(fmt.Sprintf("JS audit failed: %v", err))
+			}
+			if jsFindings == nil {
+				jsFindings = []security.Finding{}
+			}
+
+			return jsonResult(map[string]any{
+				"headers": headers,
+				"secrets": secrets,
+				"js":      jsFindings,
+			})
 		},
 	)
 
 	s.AddTool(
-		mcp.NewTool("browser_test_xss",
+		mcp.NewTool("scan_xss",
 			mcp.WithDescription("Inject XSS payloads into a field, SUBMIT the form, and confirm in the real browser DOM whether they execute (via a non-blocking marker — never alert()). Detects reflected and stored XSS, plus DOM XSS that fires on input. Returns {vulnerable, payloadsTested, findings:[{payload, executed, reflected, context, severity}]}. For authorized testing only. If the form has OTHER required fields (e.g. a name field for a stored-XSS guestbook), fill them with browser_type FIRST, then call this with a single payload. Supply your own 'payloads' for context-specific cases (use 'MARKER' as the JS marker placeholder). Use browser_get_form_fields to find selectors."),
 			mcp.WithString("selector", mcp.Required(), mcp.Description("CSS selector of the input/textarea to inject into, e.g. 'input[name=\"name\"]', '#comment'")),
 			mcp.WithString("submit_selector", mcp.Description("CSS selector of the submit button. Omit to auto-detect the submit button inside the field's form.")),
@@ -1108,23 +1091,7 @@ func registerTools(s *server.MCPServer, sess *session) {
 	)
 
 	s.AddTool(
-		mcp.NewTool("browser_audit_js",
-			mcp.WithDescription("Static analysis of page JavaScript for dangerous patterns: eval(), innerHTML assignment, document.write(), postMessage without origin check, unsafe-eval in CSP directives."),
-		),
-		func(ctx context.Context, req mcp.CallToolRequest) (*mcp.CallToolResult, error) {
-			if sess.tab == nil {
-				return errResult("browser not launched")
-			}
-			findings, err := security.AuditJavaScript(sess.tab.Context())
-			if err != nil {
-				return errResult(fmt.Sprintf("JS audit failed: %v", err))
-			}
-			return jsonResult(findings)
-		},
-	)
-
-	s.AddTool(
-		mcp.NewTool("browser_check_links",
+		mcp.NewTool("scan_links",
 			mcp.WithDescription("Crawl every <a href> on the current page, fetch each URL, and report status codes, redirects, and broken links. Returns {total, broken, skipped, links: [...]}. Same-page anchors (#) and state-changing links (logout, delete, reset...) are reported as skipped and NOT fetched, so it won't destroy your session. Can be slow on pages with many links."),
 		),
 		func(ctx context.Context, req mcp.CallToolRequest) (*mcp.CallToolResult, error) {

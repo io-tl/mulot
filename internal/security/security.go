@@ -9,7 +9,7 @@ import (
 	"time"
 
 	"github.com/chromedp/chromedp"
-	"github.com/io-tl/mulot/internal/network"
+	"github.com/io-tl/mulot/internal/journal"
 )
 
 type Finding struct {
@@ -26,7 +26,20 @@ type HeaderAudit struct {
 	Missing []string          `json:"missing"`
 }
 
-func AuditSecurityHeaders(entries []network.Entry) []HeaderAudit {
+// trackedSecurityHeaders are the response headers AuditSecurityHeaders reports
+// on; required is the subset whose absence is flagged as Missing.
+var trackedSecurityHeaders = []string{
+	"content-security-policy",
+	"x-content-type-options",
+	"x-frame-options",
+	"strict-transport-security",
+	"x-xss-protection",
+	"referrer-policy",
+	"permissions-policy",
+	"access-control-allow-origin",
+}
+
+func AuditSecurityHeaders(responses []journal.ResponseView) []HeaderAudit {
 	required := []string{
 		"content-security-policy",
 		"x-content-type-options",
@@ -35,20 +48,38 @@ func AuditSecurityHeaders(entries []network.Entry) []HeaderAudit {
 		"referrer-policy",
 	}
 
-	headers := network.GetSecurityHeaders(entries)
 	var audits []HeaderAudit
+	seen := map[string]int{} // url -> index in audits (latest response wins)
 
-	for url, found := range headers {
-		audit := HeaderAudit{
-			URL:     url,
-			Present: found,
+	for _, r := range responses {
+		// Case-insensitive lookup: CDP keeps the wire casing.
+		lower := make(map[string]string, len(r.RespHeaders))
+		for k, v := range r.RespHeaders {
+			lower[strings.ToLower(k)] = v
 		}
+		found := make(map[string]string)
+		for _, h := range trackedSecurityHeaders {
+			if v, ok := lower[h]; ok {
+				found[h] = v
+			}
+		}
+		// Report a URL only if it carries a tracked header or is a normal
+		// (2xx-3xx) response — mirrors the previous network-based gate.
+		if len(found) == 0 && !(r.Status >= 200 && r.Status < 400) {
+			continue
+		}
+		audit := HeaderAudit{URL: r.URL, Present: found}
 		for _, h := range required {
 			if _, ok := found[h]; !ok {
 				audit.Missing = append(audit.Missing, h)
 			}
 		}
-		audits = append(audits, audit)
+		if idx, ok := seen[r.URL]; ok {
+			audits[idx] = audit
+		} else {
+			seen[r.URL] = len(audits)
+			audits = append(audits, audit)
+		}
 	}
 	return audits
 }
@@ -84,23 +115,22 @@ func ScanForSecrets(ctx context.Context) ([]Finding, error) {
 	return findings, nil
 }
 
-func ScanForSecretsInNetwork(entries []network.Entry, ctx context.Context) []Finding {
+func ScanForSecretsInNetwork(responses []journal.ResponseView) []Finding {
 	var findings []Finding
-	for _, e := range entries {
-		if e.MimeType != "" && !strings.Contains(e.MimeType, "json") && !strings.Contains(e.MimeType, "javascript") {
+	for _, r := range responses {
+		if r.Body == "" {
 			continue
 		}
-		body, err := network.GetResponseBody(ctx, e.RequestID)
-		if err != nil {
+		if r.MimeType != "" && !strings.Contains(r.MimeType, "json") && !strings.Contains(r.MimeType, "javascript") {
 			continue
 		}
 		for _, pat := range secretPatterns {
-			matches := pat.FindAllStringSubmatch(body, -1)
+			matches := pat.FindAllStringSubmatch(r.Body, -1)
 			for _, match := range matches {
 				findings = append(findings, Finding{
 					Type:     "exposed-secret-network",
 					Severity: "high",
-					URL:      e.URL,
+					URL:      r.URL,
 					Detail:   fmt.Sprintf("potential secret in response: %s=<redacted>", match[1]),
 				})
 			}

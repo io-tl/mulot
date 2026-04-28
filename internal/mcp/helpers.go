@@ -91,15 +91,3 @@ func resolveTarget(args map[string]any) (string, error) {
 	}
 	return "", fmt.Errorf("provide either 'ref' (from browser_snapshot) or 'selector'")
 }
-
-func splitCSV(s string) []string {
-	parts := strings.Split(s, ",")
-	result := make([]string, 0, len(parts))
-	for _, p := range parts {
-		p = strings.TrimSpace(p)
-		if p != "" {
-			result = append(result, p)
-		}
-	}
-	return result
-}

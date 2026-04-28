@@ -9,7 +9,52 @@ import (
 	"testing"
 
 	"github.com/chromedp/chromedp"
+	"github.com/io-tl/mulot/internal/journal"
 )
+
+func TestAuditSecurityHeaders(t *testing.T) {
+	resps := []journal.ResponseView{
+		{URL: "http://x/a", Status: 200, RespHeaders: map[string]string{
+			// mixed casing — lookup must be case-insensitive
+			"Content-Security-Policy": "default-src 'self'",
+			"X-Frame-Options":         "DENY",
+		}},
+		{URL: "http://x/b", Status: 200, RespHeaders: map[string]string{}},
+		// duplicate URL, later response wins (now carries HSTS)
+		{URL: "http://x/a", Status: 200, RespHeaders: map[string]string{
+			"strict-transport-security": "max-age=63072000",
+		}},
+	}
+	audits := AuditSecurityHeaders(resps)
+	if len(audits) != 2 {
+		t.Fatalf("expected 2 deduped audits, got %d: %+v", len(audits), audits)
+	}
+	byURL := map[string]HeaderAudit{}
+	for _, a := range audits {
+		byURL[a.URL] = a
+	}
+	if _, ok := byURL["http://x/a"].Present["strict-transport-security"]; !ok {
+		t.Errorf("/a should reflect the latest response (HSTS present): %+v", byURL["http://x/a"])
+	}
+	if len(byURL["http://x/b"].Missing) != 5 {
+		t.Errorf("/b should be missing all 5 required headers, got %v", byURL["http://x/b"].Missing)
+	}
+}
+
+func TestScanForSecretsInNetworkFiltersByMime(t *testing.T) {
+	resps := []journal.ResponseView{
+		{URL: "http://x/app.js", MimeType: "application/javascript", Body: `var token = "supersecrettoken123";`},
+		{URL: "http://x/page", MimeType: "text/html", Body: `password=shouldNotBeScanned`},
+		{URL: "http://x/empty", MimeType: "application/json", Body: ``},
+	}
+	f := ScanForSecretsInNetwork(resps)
+	if len(f) != 1 {
+		t.Fatalf("expected 1 finding (js body only), got %d: %+v", len(f), f)
+	}
+	if f[0].URL != "http://x/app.js" {
+		t.Errorf("unexpected finding URL: %s", f[0].URL)
+	}
+}
 
 // reflectServer echoes the ?q= parameter back into the page, either raw
 // (reflected XSS) or HTML-escaped (safe).
