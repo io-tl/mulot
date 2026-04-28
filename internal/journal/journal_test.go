@@ -100,3 +100,71 @@ func TestJournalCapturesAndReplays(t *testing.T) {
 		t.Errorf("expected empty journal after Clear, got %d", len(remaining))
 	}
 }
+
+// TestJournalCapturesRedirectHeaders is the regression test for the natas28
+// gap: a 3xx hop (delivered by CDP via RedirectResponse, not responseReceived)
+// must be recorded with its Location/custom headers, readable via Flow().
+func TestJournalCapturesRedirectHeaders(t *testing.T) {
+	mux := http.NewServeMux()
+	mux.HandleFunc("/redir", func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("X-Secret-Blob", "blob123")
+		http.Redirect(w, r, "/dest", http.StatusFound)
+	})
+	mux.HandleFunc("/dest", func(w http.ResponseWriter, r *http.Request) {
+		w.Write([]byte("done"))
+	})
+	srv := httptest.NewServer(mux)
+	defer srv.Close()
+
+	jr, err := Open(filepath.Join(t.TempDir(), "redir.db"))
+	if err != nil {
+		t.Fatalf("Open: %v", err)
+	}
+	defer jr.Close()
+
+	ctx, cancel := tab(t)
+	defer cancel()
+	jr.Start(ctx)
+
+	if err := chromedp.Run(ctx, chromedp.Navigate(srv.URL+"/redir")); err != nil {
+		t.Fatalf("navigate: %v", err)
+	}
+
+	var redir []FlowRow
+	deadline := time.Now().Add(8 * time.Second)
+	for time.Now().Before(deadline) {
+		all, _ := jr.Query(Filter{URLContains: "/redir"})
+		for _, f := range all {
+			if f.Status == 302 {
+				redir = append(redir, f)
+			}
+		}
+		if len(redir) > 0 {
+			break
+		}
+		time.Sleep(150 * time.Millisecond)
+	}
+	if len(redir) == 0 {
+		t.Fatal("the 302 redirect hop was not journaled")
+	}
+
+	d, err := jr.Flow(redir[0].ID)
+	if err != nil || d == nil {
+		t.Fatalf("Flow: %v", err)
+	}
+	if loc := headerCI(d.RespHeaders, "location"); !strings.Contains(loc, "/dest") {
+		t.Errorf("Location header not captured, got %q", loc)
+	}
+	if headerCI(d.RespHeaders, "x-secret-blob") != "blob123" {
+		t.Errorf("custom response header not captured: %v", d.RespHeaders)
+	}
+}
+
+func headerCI(h map[string]string, name string) string {
+	for k, v := range h {
+		if strings.EqualFold(k, name) {
+			return v
+		}
+	}
+	return ""
+}
