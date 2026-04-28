@@ -139,8 +139,28 @@ func (j *Journal) Start(ctx context.Context) {
 	chromedp.ListenTarget(ctx, func(ev any) {
 		switch e := ev.(type) {
 		case *cdpNetwork.EventRequestWillBeSent:
+			reqID := string(e.RequestID)
+			// A redirect reuses the request id: the prior hop's 3xx response is
+			// delivered here as RedirectResponse (CDP never fires a separate
+			// responseReceived for it). Record that hop as its own flow so its
+			// headers — Location, Set-Cookie — are kept and queryable.
+			if e.RedirectResponse != nil {
+				j.mu.Lock()
+				prev, ok := j.pending[reqID]
+				if ok {
+					delete(j.pending, reqID)
+				}
+				j.mu.Unlock()
+				if ok {
+					prev.status = e.RedirectResponse.Status
+					prev.statusText = e.RedirectResponse.StatusText
+					prev.mimeType = e.RedirectResponse.MimeType
+					prev.respHeaders = headerMap(e.RedirectResponse.Headers)
+					j.writeFlow(prev, nil, false) // redirect hop: no body to fetch
+				}
+			}
 			p := &pending{
-				requestID:  string(e.RequestID),
+				requestID:  reqID,
 				startedAt:  time.Now().UnixMilli(),
 				method:     e.Request.Method,
 				url:        e.Request.URL,
@@ -152,7 +172,7 @@ func (j *Journal) Start(ctx context.Context) {
 				}
 			}
 			j.mu.Lock()
-			j.pending[p.requestID] = p
+			j.pending[reqID] = p
 			j.mu.Unlock()
 
 		case *cdpNetwork.EventResponseReceived:
@@ -418,6 +438,36 @@ func (j *Journal) Body(flowID int64, kind string) ([]byte, bool, error) {
 		return nil, false, err
 	}
 	return content, truncated != 0, nil
+}
+
+// FlowDetail is a single exchange with its headers — used to read response
+// headers the browser saw (Location on a redirect, Set-Cookie, WWW-Authenticate,
+// CSP, custom headers) without re-issuing the request.
+type FlowDetail struct {
+	ID          int64             `json:"id"`
+	Method      string            `json:"method"`
+	URL         string            `json:"url"`
+	Status      int               `json:"status"`
+	StatusText  string            `json:"statusText,omitempty"`
+	MimeType    string            `json:"mimeType,omitempty"`
+	ReqHeaders  map[string]string `json:"requestHeaders"`
+	RespHeaders map[string]string `json:"responseHeaders"`
+}
+
+func (j *Journal) Flow(id int64) (*FlowDetail, error) {
+	var d FlowDetail
+	var rq, rs string
+	err := j.db.QueryRow(`SELECT id, method, url, status, status_text, mime_type, req_headers, resp_headers FROM flows WHERE id = ?`, id).
+		Scan(&d.ID, &d.Method, &d.URL, &d.Status, &d.StatusText, &d.MimeType, &rq, &rs)
+	if err == sql.ErrNoRows {
+		return nil, nil
+	}
+	if err != nil {
+		return nil, err
+	}
+	json.Unmarshal([]byte(rq), &d.ReqHeaders)
+	json.Unmarshal([]byte(rs), &d.RespHeaders)
+	return &d, nil
 }
 
 // ReplayData holds what is needed to re-issue a captured request.

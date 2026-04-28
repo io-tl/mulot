@@ -785,6 +785,27 @@ func registerTools(s *server.MCPServer, sess *session) {
 	)
 
 	s.AddTool(
+		mcp.NewTool("browser_get_flow",
+			mcp.WithDescription("Get a journaled exchange (by the id from browser_get_traffic) WITH its request and response headers. This is how you read a header the browser saw but doesn't expose to JS — the Location of a 3xx redirect (e.g. an encrypted token passed in a redirect), Set-Cookie, WWW-Authenticate, CSP, or any custom header — without re-issuing the request. Redirect hops are recorded as their own flows, so filter browser_get_traffic by status (301/302) to find them."),
+			mcp.WithNumber("flow_id", mcp.Required(), mcp.Description("The flow id from browser_get_traffic.")),
+		),
+		func(ctx context.Context, req mcp.CallToolRequest) (*mcp.CallToolResult, error) {
+			if sess.journal == nil {
+				return errResult("no traffic journal — call browser_launch first")
+			}
+			idF, _ := req.GetArguments()["flow_id"].(float64)
+			flow, err := sess.journal.Flow(int64(idF))
+			if err != nil {
+				return errResult(fmt.Sprintf("failed: %v", err))
+			}
+			if flow == nil {
+				return jsonResult(map[string]any{"found": false})
+			}
+			return jsonResult(flow)
+		},
+	)
+
+	s.AddTool(
 		mcp.NewTool("browser_replay_request",
 			mcp.WithDescription("Re-issue a captured request (by its journal flow id), optionally overriding parts of it, and return the response. Combines with browser_get_traffic to do Burp-Repeater-style testing: capture a request, then replay it with a tampered id/param/header or different cookies (IDOR, access control, parameter tampering). Carries the browser session by default."),
 			mcp.WithNumber("flow_id", mcp.Required(), mcp.Description("The flow id from browser_get_traffic to replay.")),
