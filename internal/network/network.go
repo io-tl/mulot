@@ -99,6 +99,8 @@ func (m *Monitor) Start(ctx context.Context) error {
 	return chromedp.Run(ctx, cdpNetwork.Enable())
 }
 
+// GetEntries returns a snapshot of all recorded exchanges. Used by the link
+// checker and the auth access-control probe to read each request's status.
 func (m *Monitor) GetEntries() []Entry {
 	m.mu.Lock()
 	defer m.mu.Unlock()
@@ -107,28 +109,6 @@ func (m *Monitor) GetEntries() []Entry {
 		result = append(result, *e)
 	}
 	return result
-}
-
-func (m *Monitor) GetEntriesByMethod(method string) []Entry {
-	all := m.GetEntries()
-	var filtered []Entry
-	for _, e := range all {
-		if e.Method == method {
-			filtered = append(filtered, e)
-		}
-	}
-	return filtered
-}
-
-func (m *Monitor) GetFailedEntries() []Entry {
-	all := m.GetEntries()
-	var filtered []Entry
-	for _, e := range all {
-		if e.Failed || e.Status >= 400 {
-			filtered = append(filtered, e)
-		}
-	}
-	return filtered
 }
 
 // InFlight returns the number of requests that have started but not yet
@@ -147,31 +127,10 @@ func (m *Monitor) InFlight() int {
 	return n
 }
 
-func (m *Monitor) Clear() {
-	m.mu.Lock()
-	defer m.mu.Unlock()
-	m.entries = make(map[string]*Entry)
-}
-
 func (m *Monitor) Stop() {
 	m.mu.Lock()
 	defer m.mu.Unlock()
 	m.active = false
-}
-
-func GetResponseBody(ctx context.Context, requestID string) (string, error) {
-	var body []byte
-	err := chromedp.Run(ctx,
-		chromedp.ActionFunc(func(ctx context.Context) error {
-			var err error
-			body, err = cdpNetwork.GetResponseBody(cdpNetwork.RequestID(requestID)).Do(ctx)
-			return err
-		}),
-	)
-	if err != nil {
-		return "", err
-	}
-	return string(body), nil
 }
 
 func GetCookies(ctx context.Context) ([]*cdpNetwork.Cookie, error) {
@@ -205,55 +164,3 @@ func ClearCookies(ctx context.Context) error {
 	)
 }
 
-func GetSecurityHeaders(entries []Entry) map[string]map[string]string {
-	result := make(map[string]map[string]string)
-	secHeaders := []string{
-		"content-security-policy",
-		"x-content-type-options",
-		"x-frame-options",
-		"strict-transport-security",
-		"x-xss-protection",
-		"referrer-policy",
-		"permissions-policy",
-		"access-control-allow-origin",
-	}
-
-	for _, e := range entries {
-		if e.RespHeaders == nil {
-			continue
-		}
-		found := make(map[string]string)
-		for _, h := range secHeaders {
-			if v, ok := e.RespHeaders[h]; ok {
-				found[h] = v
-			} else if v, ok := e.RespHeaders[capitalize(h)]; ok {
-				found[h] = v
-			}
-		}
-		if len(found) > 0 || (e.Status >= 200 && e.Status < 400) {
-			result[e.URL] = found
-		}
-	}
-	return result
-}
-
-func capitalize(s string) string {
-	if len(s) == 0 {
-		return s
-	}
-	result := make([]byte, len(s))
-	upper := true
-	for i := 0; i < len(s); i++ {
-		if s[i] == '-' {
-			result[i] = '-'
-			upper = true
-		} else if upper && s[i] >= 'a' && s[i] <= 'z' {
-			result[i] = s[i] - 32
-			upper = false
-		} else {
-			result[i] = s[i]
-			upper = false
-		}
-	}
-	return string(result)
-}
