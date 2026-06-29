@@ -1,11 +1,12 @@
-// Package fuzz is a minimal Burp-Intruder "sniper" primitive: it takes a base
-// HTTP request containing a marker token, substitutes each payload in turn, and
-// sends it via httpx. The model supplies the payloads and the methodology; this
-// package is the mechanism.
+// Package fuzz is a minimal sniper-style fuzzing primitive (one insertion point,
+// one payload set): it takes a base HTTP request containing a marker token that
+// marks the insertion point, substitutes each payload in turn, and sends it via
+// httpx. The model supplies the payloads and the methodology; this package is the
+// mechanism.
 //
-// v1 is deliberately simple: single marker, one payload set, sequential sends,
-// and match on status/regex. No pitchfork/cluster-bomb modes, no concurrency,
-// no payload generators.
+// v1 is deliberately simple: single insertion point, one payload set, sequential
+// sends, and grep-match on status/regex. No pitchfork/cluster-bomb modes, no
+// concurrency, no payload generators.
 package fuzz
 
 import (
