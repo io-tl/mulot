@@ -14,6 +14,15 @@
 - **CSRF**: for state-changing forms (change password/email), check
   `browser_get_form_fields` for an anti-CSRF token (`user_token`, `_token`,
   `csrf`...). Absent ⇒ CSRF. Do NOT actually change the admin password.
+- **Registration string truncation**: MySQL (non-strict `sql_mode`) silently
+  truncates an INSERT that overflows a `VARCHAR(N)` column, and its default
+  collation ignores trailing spaces when comparing. Register `admin` + spaces
+  to fill the column + 1 extra char (e.g. `"admin" + " "*(N-5) + "x"` for
+  `VARCHAR(N)`) — the stored value truncates to `admin` + spaces, which then
+  compares EQUAL to the literal `'admin'` in a `WHERE username='admin'`
+  login/reset query. Confirm the column length first
+  (`browser_get_form_fields` maxlength, or an `http_fuzz` sweep of username
+  lengths watching for a truncated/duplicate-key response).
 - **IDOR / broken access control**: capture an authenticated request
   (`http_history`), then `http_request` with `from_flow` and `use_session=false`
   or another user's `cookies`. If it still returns the data, access control is

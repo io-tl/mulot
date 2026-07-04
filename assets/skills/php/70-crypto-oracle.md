@@ -66,8 +66,3 @@ If the app reveals padding-valid vs invalid differently (status/error/length),
 you can decrypt or forge any plaintext byte-by-byte. This is hundreds of
 requests → run it as ONE async loop (`browser_evaluate_js` / `http_request`)
 and return only the recovered bytes, not every response.
-
-## Method note
-Map blocks (one loop) → reason out the layout → CONSTRUCT the malicious blob →
-send once → read the result. Keep each evaluate_js self-contained and return
-only what you need (hex blocks, lengths, recovered bytes).

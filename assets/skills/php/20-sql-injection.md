@@ -21,6 +21,24 @@ form field.
    use `from_flow` to re-issue a captured request with a tampered parameter), and
    `http_fuzz` to sweep many payloads at once (`match_regex` on the SQL-error
    strings above flags injectable rows automatically).
+6. **Multibyte-charset escaping bypass (GBK/Big5)**: if the connection charset
+   is GBK/Big5/CP936 (check `Content-Type`/`meta charset`, or a `SET NAMES gbk`
+   hint in a verbose error), `addslashes()`/old `mysql_real_escape_string()`
+   escape byte-by-byte and can be defeated: a raw `0xbf` byte immediately
+   before your quote combines with the inserted backslash (`0x5c`) into ONE
+   valid GBK character, "eating" the backslash and leaving your quote live.
+   Send `%bf%27` right before the injection via `http_request`
+   (`id=1%bf%27+OR+1=1--+-` — URL-encoded raw bytes survive as-is). If it
+   behaves like a bare `'` (error or boolean flip), the bypass works.
+7. **Second-order**: a payload stored safely (parameterized INSERT) can still
+   be concatenated unsafely into a LATER, different query. Store it with one
+   `http_request` (e.g. register/profile-update:
+   `username=x' UNION SELECT user,password FROM users-- -`), then TRIGGER a
+   SEPARATE feature that reads it back into SQL (admin user list, "similar
+   items", export, password-reset-by-username) with a second
+   `http_request`/`browser_navigate`. Read the TRIGGER response for the
+   union'd data — the storage response looks clean, the bug only shows up
+   downstream.
 
 Evidence: the injected request + the SQL error or dumped data.
 Remediation: parameterized queries / PDO prepared statements; never concatenate
