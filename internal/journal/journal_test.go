@@ -168,3 +168,41 @@ func headerCI(h map[string]string, name string) string {
 	}
 	return ""
 }
+
+func TestFindings(t *testing.T) {
+	jr, err := Open(filepath.Join(t.TempDir(), "findings.db"))
+	if err != nil {
+		t.Fatalf("Open: %v", err)
+	}
+	defer jr.Close()
+
+	if got, err := jr.Findings(); err != nil || len(got) != 0 {
+		t.Fatalf("empty Findings: got %v err %v", got, err)
+	}
+
+	id1, err := jr.AddFinding("CTF{first}")
+	if err != nil {
+		t.Fatalf("AddFinding: %v", err)
+	}
+	id2, err := jr.AddFinding("second note")
+	if err != nil {
+		t.Fatalf("AddFinding: %v", err)
+	}
+	if id1 == id2 {
+		t.Fatalf("expected distinct ids, got %d and %d", id1, id2)
+	}
+
+	got, err := jr.Findings()
+	if err != nil {
+		t.Fatalf("Findings: %v", err)
+	}
+	if len(got) != 2 {
+		t.Fatalf("want 2 findings, got %d", len(got))
+	}
+	if got[0].Content != "CTF{first}" || got[1].Content != "second note" {
+		t.Errorf("unexpected order/content: %+v", got)
+	}
+	if got[0].CreatedAt == 0 {
+		t.Error("createdAt not set")
+	}
+}

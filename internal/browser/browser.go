@@ -5,6 +5,7 @@ import (
 	"sync"
 
 	"github.com/chromedp/chromedp"
+	"github.com/io-tl/mulot/internal/envcfg"
 )
 
 type Browser struct {
@@ -22,22 +23,16 @@ type Tab struct {
 }
 
 type Options struct {
-	Headless    bool
-	ChromePath  string
-	UserDataDir string
-	WindowSize  [2]int
-	ProxyURL    string
-	ExtraFlags  []string
+	Headless   bool
+	WindowSize [2]int
+	ProxyURL   string
+	UserAgent  string
 }
 
 type Option func(*Options)
 
 func WithHeadless(h bool) Option {
 	return func(o *Options) { o.Headless = h }
-}
-
-func WithChromePath(p string) Option {
-	return func(o *Options) { o.ChromePath = p }
 }
 
 func WithProxy(url string) Option {
@@ -48,10 +43,16 @@ func WithWindowSize(w, h int) Option {
 	return func(o *Options) { o.WindowSize = [2]int{w, h} }
 }
 
+func WithUserAgent(ua string) Option {
+	return func(o *Options) { o.UserAgent = ua }
+}
+
 func New(opts ...Option) *Browser {
 	o := Options{
-		Headless:   true,
+		Headless:   envcfg.Headless(true),
 		WindowSize: [2]int{1280, 720},
+		UserAgent:  envcfg.UserAgent(),
+		ProxyURL:   envcfg.ProxyURL(),
 	}
 	for _, fn := range opts {
 		fn(&o)
@@ -66,16 +67,17 @@ func (b *Browser) Start(_ context.Context) error {
 		chromedp.Flag("no-sandbox", true),
 		chromedp.Flag("disable-dev-shm-usage", true),
 		chromedp.WindowSize(b.opts.WindowSize[0], b.opts.WindowSize[1]),
+		// Targets routinely present self-signed/expired/mismatched certs (or sit
+		// behind an intercepting proxy re-signing traffic); don't let that block
+		// navigation.
+		chromedp.IgnoreCertErrors,
 	)
 
-	if b.opts.ChromePath != "" {
-		allocOpts = append(allocOpts, chromedp.ExecPath(b.opts.ChromePath))
-	}
 	if b.opts.ProxyURL != "" {
 		allocOpts = append(allocOpts, chromedp.ProxyServer(b.opts.ProxyURL))
 	}
-	if b.opts.UserDataDir != "" {
-		allocOpts = append(allocOpts, chromedp.UserDataDir(b.opts.UserDataDir))
+	if b.opts.UserAgent != "" {
+		allocOpts = append(allocOpts, chromedp.UserAgent(b.opts.UserAgent))
 	}
 
 	b.allocCtx, b.allocCancel = chromedp.NewExecAllocator(context.Background(), allocOpts...)

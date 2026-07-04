@@ -4,6 +4,7 @@ import (
 	"context"
 	"fmt"
 	"strings"
+	"time"
 
 	"github.com/chromedp/cdproto/cdp"
 	"github.com/chromedp/chromedp"
@@ -11,6 +12,11 @@ import (
 	"github.com/io-tl/mulot/internal/network"
 	"github.com/io-tl/mulot/internal/wait"
 )
+
+// loginFillTimeout bounds the form-fill and submit-click of a login attempt, so a
+// wrong (caller-supplied) field/submit selector fails fast instead of hanging the
+// session on chromedp's blocking WaitVisible/Click.
+const loginFillTimeout = 15 * time.Second
 
 type LoginResult struct {
 	Success     bool            `json:"success"`
@@ -86,7 +92,15 @@ func TestLogin(ctx context.Context, params LoginParams) (*LoginResult, error) {
 		)
 	}
 
-	if err := chromedp.Run(ctx, actions...); err != nil {
+	// Bound the fill: WaitVisible/SendKeys on a caller-supplied selector that never
+	// matches would otherwise hang forever (the tab context carries no deadline).
+	fillCtx, cancelFill := context.WithTimeout(ctx, loginFillTimeout)
+	defer cancelFill()
+	if err := chromedp.Run(fillCtx, actions...); err != nil {
+		if fillCtx.Err() == context.DeadlineExceeded {
+			return nil, fmt.Errorf("fill login form: a field selector never became visible "+
+				"within %s (check username_selector / password_selector)", loginFillTimeout)
+		}
 		return nil, fmt.Errorf("fill login form: %w", err)
 	}
 
@@ -94,7 +108,13 @@ func TestLogin(ctx context.Context, params LoginParams) (*LoginResult, error) {
 	// login establishes or rotates a session cookie.
 	beforeCookies := cookieValues(ctx)
 
-	if err := chromedp.Run(ctx, chromedp.Click(params.SubmitSelector)); err != nil {
+	clickCtx, cancelClick := context.WithTimeout(ctx, loginFillTimeout)
+	defer cancelClick()
+	if err := chromedp.Run(clickCtx, chromedp.Click(params.SubmitSelector)); err != nil {
+		if clickCtx.Err() == context.DeadlineExceeded {
+			return nil, fmt.Errorf("submit login form: submit_selector %q never became "+
+				"clickable within %s", params.SubmitSelector, loginFillTimeout)
+		}
 		return nil, fmt.Errorf("submit login form: %w", err)
 	}
 

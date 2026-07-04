@@ -57,6 +57,12 @@ CREATE TABLE IF NOT EXISTS bodies (
   size      INTEGER,
   truncated INTEGER DEFAULT 0,
   PRIMARY KEY (flow_id, kind)
+);
+
+CREATE TABLE IF NOT EXISTS findings (
+  id         INTEGER PRIMARY KEY AUTOINCREMENT,
+  created_at INTEGER NOT NULL,
+  content    TEXT NOT NULL
 );`
 
 type pending struct {
@@ -530,6 +536,45 @@ func (j *Journal) ForReplay(flowID int64) (*ReplayData, error) {
 		rd.Body = string(body)
 	}
 	return rd, nil
+}
+
+// ── Findings (agent-submitted results) ─────────────────────
+
+// Finding is a result the agent chose to persist (a flag, a proof, a note),
+// recorded into the same DB as the traffic so a batch runner can collect it.
+type Finding struct {
+	ID        int64  `json:"id"`
+	CreatedAt int64  `json:"createdAt"`
+	Content   string `json:"content"`
+}
+
+// AddFinding records an agent-submitted result into the findings table and
+// returns its row id.
+func (j *Journal) AddFinding(content string) (int64, error) {
+	res, err := j.db.Exec(`INSERT INTO findings (created_at, content) VALUES (?, ?)`,
+		time.Now().UnixMilli(), content)
+	if err != nil {
+		return 0, err
+	}
+	return res.LastInsertId()
+}
+
+// Findings returns all recorded findings, oldest first.
+func (j *Journal) Findings() ([]Finding, error) {
+	rows, err := j.db.Query(`SELECT id, created_at, content FROM findings ORDER BY id`)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	var out []Finding
+	for rows.Next() {
+		var f Finding
+		if err := rows.Scan(&f.ID, &f.CreatedAt, &f.Content); err != nil {
+			return nil, err
+		}
+		out = append(out, f)
+	}
+	return out, rows.Err()
 }
 
 // Clear empties the journal.
