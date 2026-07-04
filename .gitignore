@@ -35,3 +35,11 @@ Thumbs.db
 
 # Agent/session tooling state
 .claude/
+
+# Python / agent harness artifacts
+__pycache__/
+*.pyc
+bench-runs/
+
+# Local-only docs / blog drafts (kept out of git)
+/docs/
