@@ -7,11 +7,34 @@ package httpx
 
 import (
 	"context"
+	"crypto/tls"
 	"io"
 	"net/http"
+	"net/url"
 	"strings"
 	"time"
+
+	"github.com/io-tl/mulot/internal/envcfg"
 )
+
+// insecureTransport skips certificate verification: security-testing targets
+// routinely present self-signed, expired, or mismatched-host certs (or sit
+// behind an intercepting proxy re-signing traffic), and a broken chain
+// shouldn't stop the request from going out. Proxy only supports http(s)://
+// URLs (the stdlib transport's CONNECT tunneling) — for SOCKS5, use the
+// browser tools instead, where Chrome handles the protocol natively.
+var insecureTransport = &http.Transport{
+	TLSClientConfig: &tls.Config{InsecureSkipVerify: true},
+	Proxy:           proxyFromEnv,
+}
+
+func proxyFromEnv(*http.Request) (*url.URL, error) {
+	raw := envcfg.ProxyURL()
+	if raw == "" {
+		return nil, nil
+	}
+	return url.Parse(raw)
+}
 
 type Request struct {
 	Method          string
@@ -59,14 +82,24 @@ func Send(ctx context.Context, r Request) (*Response, error) {
 	if err != nil {
 		return nil, err
 	}
+	if ua := envcfg.UserAgent(); ua != "" {
+		req.Header.Set("User-Agent", ua)
+	}
 	for k, v := range r.Headers {
+		// net/http derives the wire Host from req.URL and ignores a "Host"
+		// set via Header, so route it to req.Host explicitly — otherwise
+		// host-header injection tests are a silent no-op.
+		if strings.EqualFold(k, "Host") {
+			req.Host = v
+			continue
+		}
 		req.Header.Set(k, v)
 	}
 	for _, c := range r.Cookies {
 		req.AddCookie(c)
 	}
 
-	client := &http.Client{Timeout: timeout}
+	client := &http.Client{Timeout: timeout, Transport: insecureTransport}
 	if !r.FollowRedirects {
 		client.CheckRedirect = func(*http.Request, []*http.Request) error {
 			return http.ErrUseLastResponse

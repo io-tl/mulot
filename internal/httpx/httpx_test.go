@@ -7,7 +7,90 @@ import (
 	"net/http/httptest"
 	"strings"
 	"testing"
+
+	"github.com/io-tl/mulot/internal/envcfg"
 )
+
+func TestSendUserAgentFromEnv(t *testing.T) {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("X-Seen-UA", r.Header.Get("User-Agent"))
+	}))
+	defer srv.Close()
+
+	t.Setenv(envcfg.UserAgentVar, "mulot-test-agent/1.0")
+
+	resp, err := Send(context.Background(), Request{URL: srv.URL})
+	if err != nil {
+		t.Fatalf("Send: %v", err)
+	}
+	if got := resp.Headers["X-Seen-Ua"]; got != "mulot-test-agent/1.0" {
+		t.Errorf("User-Agent = %q, want env override", got)
+	}
+
+	// An explicit header still wins over the env default.
+	resp2, err := Send(context.Background(), Request{
+		URL:     srv.URL,
+		Headers: map[string]string{"User-Agent": "explicit-agent/2.0"},
+	})
+	if err != nil {
+		t.Fatalf("Send: %v", err)
+	}
+	if got := resp2.Headers["X-Seen-Ua"]; got != "explicit-agent/2.0" {
+		t.Errorf("User-Agent = %q, want explicit header to win", got)
+	}
+}
+
+func TestSendRoutesThroughEnvProxy(t *testing.T) {
+	proxy := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("X-Via-Proxy", "1")
+		w.Write([]byte("proxied"))
+	}))
+	defer proxy.Close()
+
+	t.Setenv(envcfg.ProxyVar, proxy.URL)
+
+	// This target would fail to resolve if dialed directly — it's only
+	// reachable through the proxy above, which answers any request
+	// regardless of destination.
+	resp, err := Send(context.Background(), Request{URL: "http://mulot-test-target.invalid/"})
+	if err != nil {
+		t.Fatalf("Send should have gone through the proxy: %v", err)
+	}
+	if resp.Headers["X-Via-Proxy"] != "1" || resp.Body != "proxied" {
+		t.Errorf("response = %+v, want to see it routed via the proxy", resp)
+	}
+}
+
+func TestSendNoProxyByDefault(t *testing.T) {
+	t.Setenv(envcfg.ProxyVar, "")
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Write([]byte("direct"))
+	}))
+	defer srv.Close()
+
+	resp, err := Send(context.Background(), Request{URL: srv.URL})
+	if err != nil {
+		t.Fatalf("Send: %v", err)
+	}
+	if resp.Body != "direct" {
+		t.Errorf("body = %q, want direct (no proxy)", resp.Body)
+	}
+}
+
+func TestSendIgnoresBadCertificate(t *testing.T) {
+	srv := httptest.NewTLSServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Write([]byte("ok"))
+	}))
+	defer srv.Close()
+
+	resp, err := Send(context.Background(), Request{URL: srv.URL})
+	if err != nil {
+		t.Fatalf("Send should not fail on a self-signed cert: %v", err)
+	}
+	if resp.Status != 200 || resp.Body != "ok" {
+		t.Errorf("status/body = %d/%q, want 200/ok", resp.Status, resp.Body)
+	}
+}
 
 func TestSendPassesMethodHeaderCookieBody(t *testing.T) {
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
