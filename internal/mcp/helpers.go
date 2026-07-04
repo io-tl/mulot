@@ -9,6 +9,7 @@ import (
 	"net/url"
 	"os"
 	"path/filepath"
+	"strconv"
 	"strings"
 
 	"github.com/io-tl/mulot/internal/dom"
@@ -56,6 +57,73 @@ func argStringMap(v any) map[string]string {
 		}
 	}
 	return out
+}
+
+// argFloat reads an argument as a float64, tolerating either a JSON number
+// (float64, the normal case) or a numeric string ("200") — several tool-calling
+// models emit every argument value as a string. Returns (0, false) when the key
+// is absent, empty, or not coercible, so a caller's `if v, ok := argFloat(...)`
+// guard behaves exactly like the old `.(float64)` assertion for well-typed input.
+func argFloat(args map[string]any, key string) (float64, bool) {
+	switch v := args[key].(type) {
+	case float64:
+		return v, true
+	case int:
+		return float64(v), true
+	case json.Number:
+		if f, err := v.Float64(); err == nil {
+			return f, true
+		}
+	case string:
+		if s := strings.TrimSpace(v); s != "" {
+			if f, err := strconv.ParseFloat(s, 64); err == nil {
+				return f, true
+			}
+		}
+	}
+	return 0, false
+}
+
+// argInt is argFloat truncated to an int.
+func argInt(args map[string]any, key string) (int, bool) {
+	f, ok := argFloat(args, key)
+	return int(f), ok
+}
+
+// argBool reads an argument as a bool, tolerating a real JSON bool, the common
+// stringified forms ("true"/"false"/"1"/"0"/"yes"/"no"), or a 0/1 number.
+// Returns (false, false) when the key is absent or not coercible.
+func argBool(args map[string]any, key string) (bool, bool) {
+	switch v := args[key].(type) {
+	case bool:
+		return v, true
+	case float64:
+		return v != 0, true
+	case string:
+		switch strings.ToLower(strings.TrimSpace(v)) {
+		case "true", "1", "yes", "y":
+			return true, true
+		case "false", "0", "no", "n":
+			return false, true
+		}
+	}
+	return false, false
+}
+
+// argString reads an argument as a string, tolerating a numeric or boolean value
+// delivered where a string was expected (a model may send 200 instead of "200").
+// Returns ("", false) when the key is absent or null — callers use the ok flag to
+// enforce required fields instead of a bare `.(string)` assertion that panics.
+func argString(args map[string]any, key string) (string, bool) {
+	switch v := args[key].(type) {
+	case string:
+		return v, true
+	case float64:
+		return strconv.FormatFloat(v, 'f', -1, 64), true
+	case bool:
+		return strconv.FormatBool(v), true
+	}
+	return "", false
 }
 
 // sessionCookiesFor returns the browser's cookies that apply to rawURL's host,

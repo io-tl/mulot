@@ -6,9 +6,11 @@ import (
 	"fmt"
 	"net/http"
 	"reflect"
+	"strconv"
 	"time"
 
 	"github.com/chromedp/chromedp"
+	"github.com/io-tl/mulot/assets"
 	"github.com/io-tl/mulot/internal/auth"
 	"github.com/io-tl/mulot/internal/browser"
 	"github.com/io-tl/mulot/internal/dom"
@@ -32,6 +34,11 @@ type session struct {
 	dialogs *browser.DialogHandler
 	journal *journal.Journal
 }
+
+// interactionTimeout bounds the blocking chromedp Query actions (SendKeys,
+// SetUploadFiles): a selector that matches nothing — or a node that never
+// becomes visible/ready — must fail with an error, never hang the session.
+const interactionTimeout = 15 * time.Second
 
 func Run() error {
 	s := server.NewMCPServer(
@@ -77,7 +84,7 @@ func errResult(msg string) (*mcp.CallToolResult, error) {
 func buildBaseRequest(sess *session, args map[string]any) (httpx.Request, error) {
 	var r httpx.Request
 
-	if f, ok := args["from_flow"].(float64); ok && f != 0 {
+	if f, ok := argFloat(args, "from_flow"); ok && f != 0 {
 		if sess.journal == nil {
 			return r, fmt.Errorf("no traffic journal — call browser_launch first")
 		}
@@ -104,11 +111,11 @@ func buildBaseRequest(sess *session, args map[string]any) (httpx.Request, error)
 		}
 		r.Headers[k] = v
 	}
-	if f, ok := args["follow_redirects"].(bool); ok {
+	if f, ok := argBool(args, "follow_redirects"); ok {
 		r.FollowRedirects = f
 	}
-	if t, ok := args["timeout_ms"].(float64); ok {
-		r.TimeoutMs = int(t)
+	if t, ok := argInt(args, "timeout_ms"); ok {
+		r.TimeoutMs = t
 	}
 
 	if r.URL == "" {
@@ -116,7 +123,7 @@ func buildBaseRequest(sess *session, args map[string]any) (httpx.Request, error)
 	}
 
 	useSession := true
-	if s, ok := args["use_session"].(bool); ok {
+	if s, ok := argBool(args, "use_session"); ok {
 		useSession = s
 	}
 	if useSession && sess.tab != nil {
@@ -128,6 +135,52 @@ func buildBaseRequest(sess *session, args map[string]any) (httpx.Request, error)
 	return r, nil
 }
 
+// fuzzSummary is the compact view returned when http_fuzz is driven by a
+// server-side wordlist: the full per-payload table would bloat the context, so
+// we return a status histogram plus only the interesting rows (matched if a
+// grep criterion was set, otherwise anything that is not a plain 404/no-response).
+type fuzzSummary struct {
+	Wordlist     string         `json:"wordlist"`
+	Total        int            `json:"total"`
+	StatusCounts map[string]int `json:"statusCounts"`
+	Hits         []fuzz.Result  `json:"hits"`
+}
+
+func summarizeFuzz(tag string, out *fuzz.Output, hasCriteria bool) fuzzSummary {
+	s := fuzzSummary{Wordlist: tag, Total: out.Count, StatusCounts: map[string]int{}, Hits: []fuzz.Result{}}
+	for _, r := range out.Results {
+		s.StatusCounts[strconv.Itoa(r.Status)]++
+		keep := r.Status != 404 && r.Status != 0
+		if hasCriteria {
+			keep = r.Matched
+		}
+		if keep {
+			s.Hits = append(s.Hits, r)
+		}
+	}
+	return s
+}
+
+// wordlistInjectJS builds the JS that defines window.mulotWordlist(tag) over the
+// embedded wordlists, parsed into arrays HERE (Go) so the model never sees or
+// splits raw text. The whole payload crosses CDP into the page, not the context.
+func wordlistInjectJS() (string, error) {
+	all := map[string][]string{}
+	for _, t := range assets.WordlistTags() {
+		entries, err := assets.Wordlist(t)
+		if err != nil {
+			return "", err
+		}
+		all[t] = entries
+	}
+	data, err := json.Marshal(all)
+	if err != nil {
+		return "", err
+	}
+	return "window.__mulot_wl = " + string(data) +
+		"; window.mulotWordlist = function(t){ return (window.__mulot_wl[t] || []).slice(); };\n\"ok\"", nil
+}
+
 func registerTools(s *server.MCPServer, sess *session) {
 
 	// ── Lifecycle ──────────────────────────────────────────────
@@ -135,8 +188,8 @@ func registerTools(s *server.MCPServer, sess *session) {
 	s.AddTool(
 		mcp.NewTool("browser_launch",
 			mcp.WithDescription("Start a Chromium browser. MUST be called before any other browser_ tool. Auto-starts network/console/dialog monitoring and the always-on HTTP traffic journal (SQLite). Calling again closes the previous instance."),
-			mcp.WithBoolean("headless", mcp.Description("Run without visible UI (default: true). Set false for visual debugging.")),
-			mcp.WithString("proxy", mcp.Description("Upstream HTTP/SOCKS5 proxy to route the browser through — point it at an intercepting proxy to capture and replay traffic on the wire, e.g. 'http://127.0.0.1:8080' (intercepting proxy) or 'socks5://127.0.0.1:9050' (Tor).")),
+			mcp.WithBoolean("headless", mcp.Description("Run without visible UI (default: true, or $MULOT_HEADLESS). Set false for visual debugging.")),
+			mcp.WithString("proxy", mcp.Description("Upstream HTTP/SOCKS5 proxy to route the browser through — point it at an intercepting proxy to capture and replay traffic on the wire, e.g. 'http://127.0.0.1:8080' (intercepting proxy) or 'socks5://127.0.0.1:9050' (Tor). Defaults to $MULOT_PROXY when unset.")),
 			mcp.WithString("journal_db", mcp.Description("Path to the SQLite traffic journal (default: ~/.mulot/traffic.db). The journal records every request/response automatically.")),
 		),
 		func(ctx context.Context, req mcp.CallToolRequest) (*mcp.CallToolResult, error) {
@@ -146,9 +199,9 @@ func registerTools(s *server.MCPServer, sess *session) {
 				sess.browser.Close()
 			}
 
-			opts := []browser.Option{browser.WithHeadless(true)}
-			if h, ok := args["headless"].(bool); ok {
-				opts = []browser.Option{browser.WithHeadless(h)}
+			var opts []browser.Option
+			if h, ok := argBool(args, "headless"); ok {
+				opts = append(opts, browser.WithHeadless(h))
 			}
 			if p, ok := args["proxy"].(string); ok && p != "" {
 				opts = append(opts, browser.WithProxy(p))
@@ -332,11 +385,11 @@ func registerTools(s *server.MCPServer, sess *session) {
 			cond.State, _ = args["state"].(string)
 			cond.Text, _ = args["text"].(string)
 			cond.URLContains, _ = args["url_contains"].(string)
-			if ni, ok := args["network_idle"].(bool); ok {
+			if ni, ok := argBool(args, "network_idle"); ok {
 				cond.NetworkIdle = ni
 			}
-			if t, ok := args["timeout_ms"].(float64); ok {
-				cond.TimeoutMs = int(t)
+			if t, ok := argInt(args, "timeout_ms"); ok {
+				cond.TimeoutMs = t
 			}
 
 			var inFlight wait.InFlightFunc
@@ -515,10 +568,25 @@ func registerTools(s *server.MCPServer, sess *session) {
 			}
 			text, _ := args["text"].(string)
 			clear := true
-			if c, ok := args["clear"].(bool); ok {
+			if c, ok := argBool(args, "clear"); ok {
 				clear = c
 			}
 			tctx := sess.tab.Context()
+			// Resolve the node up front (instant, like browser_click) so a missing
+			// or hidden selector returns a clear error instead of SendKeys blocking
+			// forever waiting for the node to appear / become visible.
+			el, err := dom.QueryOne(tctx, sel)
+			if err != nil {
+				return errResult(fmt.Sprintf("type failed: %v", err))
+			}
+			if el == nil {
+				return errResult(fmt.Sprintf("type failed: no element matches selector %q", sel))
+			}
+			if !el.Visible {
+				return errResult(fmt.Sprintf("type failed: %q exists but is not visible — "+
+					"chromedp cannot send real keystrokes to a hidden field. Set its value "+
+					"with browser_evaluate_js, or target the visible input.", sel))
+			}
 			// JS-based clear works on empty fields (chromedp.Clear errors with
 			// "does not have child #text node") and on framework-controlled inputs.
 			if clear {
@@ -526,7 +594,15 @@ func registerTools(s *server.MCPServer, sess *session) {
 					return errResult(fmt.Sprintf("type failed: %v", err))
 				}
 			}
-			if err := chromedp.Run(tctx, chromedp.SendKeys(sel, text)); err != nil {
+			// Bound SendKeys: even a visible field can stall (covered/animating); an
+			// unbounded action would hang the whole session.
+			actx, cancel := context.WithTimeout(tctx, interactionTimeout)
+			defer cancel()
+			if err := chromedp.Run(actx, chromedp.SendKeys(sel, text)); err != nil {
+				if actx.Err() == context.DeadlineExceeded {
+					return errResult(fmt.Sprintf("type failed: %q did not accept keystrokes "+
+						"within %s (covered or disabled?)", sel, interactionTimeout))
+				}
 				return errResult(fmt.Sprintf("type failed: %v", err))
 			}
 			return mcp.NewToolResultText(fmt.Sprintf("Typed into: %s", sel)), nil
@@ -587,7 +663,26 @@ func registerTools(s *server.MCPServer, sess *session) {
 				}
 				path = p
 			}
-			if err := sess.tab.Run(chromedp.SetUploadFiles(sel, []string{path}, chromedp.ByQuery)); err != nil {
+			// A file <input> is commonly display:none (sites overlay a styled
+			// button), so we do NOT require visibility — but we DO confirm the node
+			// exists up front, otherwise SetUploadFiles blocks forever waiting for a
+			// node that never appears (the usual cause of a hung upload on a guessed
+			// selector).
+			tctx := sess.tab.Context()
+			el, err := dom.QueryOne(tctx, sel)
+			if err != nil {
+				return errResult(fmt.Sprintf("upload failed: %v", err))
+			}
+			if el == nil {
+				return errResult(fmt.Sprintf("upload failed: no file input matches selector %q "+
+					"(is the upload form present on this page?)", sel))
+			}
+			actx, cancel := context.WithTimeout(tctx, interactionTimeout)
+			defer cancel()
+			if err := chromedp.Run(actx, chromedp.SetUploadFiles(sel, []string{path}, chromedp.ByQuery)); err != nil {
+				if actx.Err() == context.DeadlineExceeded {
+					return errResult(fmt.Sprintf("upload failed: attaching to %q timed out after %s", sel, interactionTimeout))
+				}
 				return errResult(fmt.Sprintf("upload failed: %v", err))
 			}
 			return mcp.NewToolResultText(fmt.Sprintf("Attached %s to %s — now click the submit button to upload", path, sel)), nil
@@ -607,7 +702,7 @@ func registerTools(s *server.MCPServer, sess *session) {
 			args := req.GetArguments()
 			dir, _ := args["direction"].(string)
 			px := 500.0
-			if p, ok := args["pixels"].(float64); ok {
+			if p, ok := argFloat(args, "pixels"); ok {
 				px = p
 			}
 			if dir == "up" {
@@ -635,7 +730,7 @@ func registerTools(s *server.MCPServer, sess *session) {
 			args := req.GetArguments()
 			expr, _ := args["expression"].(string)
 			timeout := 30 * time.Second
-			if t, ok := args["timeout_ms"].(float64); ok && t > 0 {
+			if t, ok := argFloat(args, "timeout_ms"); ok && t > 0 {
 				timeout = time.Duration(t) * time.Millisecond
 			}
 			tctx, cancel := context.WithTimeout(sess.tab.Context(), timeout)
@@ -699,8 +794,9 @@ func registerTools(s *server.MCPServer, sess *session) {
 
 	s.AddTool(
 		mcp.NewTool("http_fuzz",
-			mcp.WithDescription("Sniper-style fuzzing (one insertion point, one payload set): take a base request containing a marker token (default 'FUZZ') that marks the insertion point, substitute each payload in turn, send it (outside CORS), and return one row per payload {payload, status, length, timeMs, matched}. The marker (insertion point) is replaced in the URL, body, header values, and cookie values. Build the base from scratch (url) or from a captured exchange (from_flow). Use it to generalize what you'd do one-by-one in http_request: SQLi (error and boolean-blind via length/status deltas off the baseline), forced browsing / content discovery (directory & file enumeration), parameter and value fuzzing, brute force. Supply match_status/match_regex as grep-match conditions to flag hits; otherwise read the status/length columns yourself to spot anomalies. Sequential, single insertion point, max 500 payloads per call (split into batches beyond that). For DOM-XSS execution proof use scan_xss instead — this tool only sees raw HTTP."),
-			mcp.WithArray("payloads", mcp.Required(), mcp.Description("The payload set (payload list) substituted at the insertion point, one send per payload, e.g. [\"1' AND '1'='1\",\"1' AND '1'='2\"] or a wordlist of paths. Max 500."), mcp.Items(map[string]any{"type": "string"})),
+			mcp.WithDescription("Sniper-style fuzzing (one insertion point, one payload set): take a base request containing a marker token (default 'FUZZ') that marks the insertion point, substitute each payload in turn, send it (outside CORS), and return one row per payload {payload, status, length, timeMs, matched}. The marker (insertion point) is replaced in the URL, body, header values, and cookie values. Build the base from scratch (url) or from a captured exchange (from_flow). Use it to generalize what you'd do one-by-one in http_request: SQLi (error and boolean-blind via length/status deltas off the baseline), forced browsing / content discovery (directory & file enumeration), parameter and value fuzzing, brute force. Supply match_status/match_regex as grep-match conditions to flag hits; otherwise read the status/length columns yourself to spot anomalies. Sequential, single insertion point, max 500 payloads per call (split into batches beyond that). Instead of an inline 'payloads' list you can pass wordlist=<tag> (see list_wordlists) to drive the run from a server-side embedded wordlist WITHOUT loading its entries into your context — the response is then summarized (a status histogram + only the interesting/matched rows), so a big list does not flood your context either. Pass exactly one of payloads or wordlist. For DOM-XSS execution proof use scan_xss instead — this tool only sees raw HTTP."),
+			mcp.WithArray("payloads", mcp.Description("The payload set (payload list) substituted at the insertion point, one send per payload, e.g. [\"1' AND '1'='1\",\"1' AND '1'='2\"] or a wordlist of paths. Max 500. Provide this OR 'wordlist'."), mcp.Items(map[string]any{"type": "string"})),
+			mcp.WithString("wordlist", mcp.Description("Name of an embedded wordlist (see list_wordlists, e.g. 'pages', 'params', 'passwords') to use as the payload set instead of 'payloads'. Expanded server-side; the response is summarized to keep your context small.")),
 			mcp.WithString("marker", mcp.Description("Token that marks the insertion point — replaced by each payload (default 'FUZZ'). Place it at the payload position you want to inject, e.g. url '.../?id=FUZZ'.")),
 			mcp.WithString("attack_type", mcp.Description("Attack mode. Only 'sniper' is supported (the default): a single insertion point cycled through one payload set. Multi-position modes (battering ram, pitchfork, cluster bomb) are NOT available — fuzz one position per call.")),
 			mcp.WithString("url", mcp.Description("Base URL containing the marker, e.g. 'http://host/?id=FUZZ'. Required unless from_flow is given.")),
@@ -723,8 +819,8 @@ func registerTools(s *server.MCPServer, sess *session) {
 			p := fuzz.Params{Base: r}
 			p.Marker, _ = args["marker"].(string)
 			p.MatchRegex, _ = args["match_regex"].(string)
-			if v, ok := args["match_status"].(float64); ok {
-				p.MatchStatus = int(v)
+			if v, ok := argInt(args, "match_status"); ok {
+				p.MatchStatus = v
 			}
 			if raw, ok := args["payloads"].([]any); ok {
 				for _, pv := range raw {
@@ -733,9 +829,28 @@ func registerTools(s *server.MCPServer, sess *session) {
 					}
 				}
 			}
+			// A wordlist tag expands server-side into the payload set, so its
+			// entries never enter the model's context.
+			wl, _ := args["wordlist"].(string)
+			if wl != "" {
+				if len(p.Payloads) > 0 {
+					return errResult("pass exactly one of 'payloads' or 'wordlist', not both")
+				}
+				entries, err := assets.Wordlist(wl)
+				if err != nil {
+					return errResult(err.Error())
+				}
+				p.Payloads = entries
+			}
 			out, err := fuzz.Run(ctx, p)
 			if err != nil {
 				return errResult(fmt.Sprintf("fuzz failed: %v", err))
+			}
+			// When driven by a wordlist, return a compact summary (status
+			// histogram + only the interesting/matched rows) instead of one row
+			// per payload, so a big list does not flood the context.
+			if wl != "" {
+				return jsonResult(summarizeFuzz(wl, out, p.MatchStatus != 0 || p.MatchRegex != ""))
 			}
 			return jsonResult(out)
 		},
@@ -765,17 +880,17 @@ func registerTools(s *server.MCPServer, sess *session) {
 			f.Method, _ = args["method"].(string)
 			f.URLContains, _ = args["url_contains"].(string)
 			f.BodyContains, _ = args["body_contains"].(string)
-			if v, ok := args["status"].(float64); ok {
-				f.Status = int(v)
+			if v, ok := argInt(args, "status"); ok {
+				f.Status = v
 			}
-			if v, ok := args["status_min"].(float64); ok {
-				f.StatusMin = int(v)
+			if v, ok := argInt(args, "status_min"); ok {
+				f.StatusMin = v
 			}
-			if v, ok := args["since_id"].(float64); ok {
+			if v, ok := argFloat(args, "since_id"); ok {
 				f.SinceID = int64(v)
 			}
-			if v, ok := args["limit"].(float64); ok {
-				f.Limit = int(v)
+			if v, ok := argInt(args, "limit"); ok {
+				f.Limit = v
 			}
 			flows, err := sess.journal.Query(f)
 			if err != nil {
@@ -796,7 +911,7 @@ func registerTools(s *server.MCPServer, sess *session) {
 				return errResult("no traffic journal — call browser_launch first")
 			}
 			args := req.GetArguments()
-			idF, _ := args["flow_id"].(float64)
+			idF, _ := argFloat(args, "flow_id")
 			kind, _ := args["kind"].(string)
 			if kind == "" {
 				kind = "response"
@@ -826,7 +941,7 @@ func registerTools(s *server.MCPServer, sess *session) {
 			if sess.journal == nil {
 				return errResult("no traffic journal — call browser_launch first")
 			}
-			idF, _ := req.GetArguments()["flow_id"].(float64)
+			idF, _ := argFloat(req.GetArguments(), "flow_id")
 			flow, err := sess.journal.Flow(int64(idF))
 			if err != nil {
 				return errResult(fmt.Sprintf("failed: %v", err))
@@ -927,7 +1042,7 @@ func registerTools(s *server.MCPServer, sess *session) {
 			}
 			args := req.GetArguments()
 			accept := true
-			if a, ok := args["accept"].(bool); ok {
+			if a, ok := argBool(args, "accept"); ok {
 				accept = a
 			}
 			promptText, _ := args["prompt_text"].(string)
@@ -985,21 +1100,38 @@ func registerTools(s *server.MCPServer, sess *session) {
 				return errResult("browser not launched")
 			}
 			args := req.GetArguments()
-			params := auth.LoginParams{
-				URL:              args["url"].(string),
-				UsernameSelector: args["username_selector"].(string),
-				PasswordSelector: args["password_selector"].(string),
-				SubmitSelector:   args["submit_selector"].(string),
-				Username:         args["username"].(string),
-				Password:         args["password"].(string),
+			// Structural fields must be present and non-empty — a missing or
+			// mistyped one returns a clear error instead of panicking the handler
+			// on a bare `.(string)` assertion (weak models omit or stringify args).
+			for _, k := range []string{"url", "username_selector",
+				"password_selector", "submit_selector"} {
+				if v, ok := argString(args, k); !ok || v == "" {
+					return errResult(fmt.Sprintf("%s is required", k))
+				}
 			}
-			if si, ok := args["success_indicator"].(string); ok {
+			// Credentials may legitimately be empty (e.g. testing a blank-password
+			// bypass), so require presence but tolerate an empty value.
+			url, _ := argString(args, "url")
+			userSel, _ := argString(args, "username_selector")
+			passSel, _ := argString(args, "password_selector")
+			submitSel, _ := argString(args, "submit_selector")
+			username, _ := argString(args, "username")
+			password, _ := argString(args, "password")
+			params := auth.LoginParams{
+				URL:              url,
+				UsernameSelector: userSel,
+				PasswordSelector: passSel,
+				SubmitSelector:   submitSel,
+				Username:         username,
+				Password:         password,
+			}
+			if si, ok := argString(args, "success_indicator"); ok {
 				params.SuccessIndicator = si
 			}
-			if fi, ok := args["failure_indicator"].(string); ok {
+			if fi, ok := argString(args, "failure_indicator"); ok {
 				params.FailureIndicator = fi
 			}
-			if iso, ok := args["isolate_session"].(bool); ok {
+			if iso, ok := argBool(args, "isolate_session"); ok {
 				params.IsolateSession = iso
 			}
 			result, err := auth.TestLogin(sess.tab.Context(), params)
@@ -1038,7 +1170,7 @@ func registerTools(s *server.MCPServer, sess *session) {
 			if err != nil {
 				return errResult(fmt.Sprintf("secret scan failed: %v", err))
 			}
-			if incNet, ok := req.GetArguments()["include_network"].(bool); ok && incNet {
+			if incNet, ok := argBool(req.GetArguments(), "include_network"); ok && incNet {
 				secrets = append(secrets, security.ScanForSecretsInNetwork(views)...)
 			}
 			if secrets == nil {
@@ -1116,6 +1248,127 @@ func registerTools(s *server.MCPServer, sess *session) {
 				"skipped": skipped,
 				"links":   results,
 			})
+		},
+	)
+
+	// ── Knowledge & assets (embedded, served by tag/name) ──────
+
+	s.AddTool(
+		mcp.NewTool("list_skills",
+			mcp.WithDescription("List the available stack playbook sets embedded in the binary. Returns {stacks:[...]}. After fingerprinting the target's technology stack, call load_skill with the matching name(s) to pull the tailored testing playbooks into context."),
+		),
+		func(ctx context.Context, req mcp.CallToolRequest) (*mcp.CallToolResult, error) {
+			return jsonResult(map[string]any{"stacks": assets.Skills()})
+		},
+	)
+
+	s.AddTool(
+		mcp.NewTool("load_skill",
+			mcp.WithDescription("Load testing playbooks embedded in the binary. Pass the stack name(s) you fingerprinted to get stack-specific guidance (SQLi, XSS, auth, deserialization, ...) for that technology — call again as you discover more stacks. With NO arguments it returns the shared workflow (the tool catalogue + the generic method). Use list_skills to see valid stack names."),
+			mcp.WithArray("stacks", mcp.Description("Detected technology stack(s) to load, e.g. [\"php\"] or [\"python\",\"nodejs\"]. Omit to get the shared workflow."), mcp.Items(map[string]any{"type": "string"})),
+		),
+		func(ctx context.Context, req mcp.CallToolRequest) (*mcp.CallToolResult, error) {
+			var stacks []string
+			if raw, ok := req.GetArguments()["stacks"].([]any); ok {
+				for _, v := range raw {
+					if s, ok := v.(string); ok && s != "" {
+						stacks = append(stacks, s)
+					}
+				}
+			}
+			if len(stacks) == 0 {
+				wf, err := assets.Workflow()
+				if err != nil {
+					return errResult(err.Error())
+				}
+				return mcp.NewToolResultText(wf), nil
+			}
+			content, err := assets.LoadSkill(stacks...)
+			if err != nil {
+				return errResult(err.Error())
+			}
+			return mcp.NewToolResultText(content), nil
+		},
+	)
+
+	s.AddTool(
+		mcp.NewTool("list_wordlists",
+			mcp.WithDescription("List the embedded bruteforce wordlists available by tag. Returns [{tag, count, sample}] — only a 3-entry sample per list, never the full content. Pass a tag to http_fuzz (wordlist=<tag>) or to browser_inject (helper='wordlist', then mulotWordlist('<tag>') in browser_evaluate_js) so the entries are expanded server-side / in-page and never loaded into your context."),
+		),
+		func(ctx context.Context, req mcp.CallToolRequest) (*mcp.CallToolResult, error) {
+			tags := assets.WordlistTags()
+			out := make([]map[string]any, 0, len(tags))
+			for _, t := range tags {
+				entries, err := assets.Wordlist(t)
+				if err != nil {
+					continue
+				}
+				sample := entries
+				if len(sample) > 3 {
+					sample = sample[:3]
+				}
+				out = append(out, map[string]any{"tag": t, "count": len(entries), "sample": sample})
+			}
+			return jsonResult(out)
+		},
+	)
+
+	s.AddTool(
+		mcp.NewTool("browser_inject",
+			mcp.WithDescription("Inject an embedded JS helper library into the current page so its functions are available to subsequent browser_evaluate_js calls. Helpers: 'crypto' defines window.mulotCrypto — synchronous md5/sha1/sha256/hmac/rc4 that work even on an insecure http:// context where crypto.subtle is undefined; 'wordlist' defines window.mulotWordlist(tag) returning an embedded list as a real JS array, so an in-page fetch loop can iterate it WITHOUT the entries ever entering your context. Re-inject after a navigation (page-load clears window globals)."),
+			mcp.WithString("helper", mcp.Required(), mcp.Description("Which helper to inject: 'crypto' or 'wordlist'.")),
+		),
+		func(ctx context.Context, req mcp.CallToolRequest) (*mcp.CallToolResult, error) {
+			if sess.tab == nil {
+				return errResult("browser not launched")
+			}
+			helper, _ := req.GetArguments()["helper"].(string)
+			var code, defines string
+			switch helper {
+			case "crypto":
+				src, err := assets.JS("crypto")
+				if err != nil {
+					return errResult(err.Error())
+				}
+				code = src + "\n\"ok\""
+				defines = "window.mulotCrypto (md5/sha1/sha256/hmac/rc4)"
+			case "wordlist":
+				c, err := wordlistInjectJS()
+				if err != nil {
+					return errResult(err.Error())
+				}
+				code = c
+				defines = "window.mulotWordlist(tag)"
+			default:
+				return errResult(fmt.Sprintf("unknown helper %q (have: crypto, wordlist)", helper))
+			}
+			if _, err := js.Evaluate(sess.tab.Context(), code); err != nil {
+				return errResult(fmt.Sprintf("inject failed: %v", err))
+			}
+			return mcp.NewToolResultText(fmt.Sprintf("Injected %q — defined %s", helper, defines)), nil
+		},
+	)
+
+	// ── Findings / export (into mulot's SQLite DB) ─────────────
+
+	s.AddTool(
+		mcp.NewTool("export",
+			mcp.WithDescription("Record a result (a captured flag, a proof, a key finding) into mulot's SQLite database (the same run journal as the traffic), so a batch/automation runner can collect it afterwards by reading the .db. Call it once you have obtained the answer the task asked for. Returns {id, db_path}."),
+			mcp.WithString("result", mcp.Required(), mcp.Description("The result to persist, e.g. a flag 'CTF{...}' or a short finding. Stored verbatim.")),
+		),
+		func(ctx context.Context, req mcp.CallToolRequest) (*mcp.CallToolResult, error) {
+			if sess.journal == nil {
+				return errResult("no traffic journal — call browser_launch first")
+			}
+			result, _ := req.GetArguments()["result"].(string)
+			if result == "" {
+				return errResult("result is required")
+			}
+			id, err := sess.journal.AddFinding(result)
+			if err != nil {
+				return errResult(fmt.Sprintf("export failed: %v", err))
+			}
+			return jsonResult(map[string]any{"id": id, "db_path": sess.journal.Path()})
 		},
 	)
 }
