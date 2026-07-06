@@ -40,7 +40,7 @@ PROVIDERS = {
     "openrouter": {"base": "https://openrouter.ai/api/v1", "key_env": "OPENROUTER_API_KEY",
                    "default_model": None},
     "llamacpp":   {"base": "http://192.168.0.11:8080/v1", "key_env": "LLAMA_API_KEY",
-                   "default_model": "gemma4-12b"},
+                   "default_model": "qwen3.6-mtp"},
     "zai":        {"base": "https://api.z.ai/api/coding/paas/v4", "key_env": "ZAI_API_KEY",
                    "default_model": "glm-5.2"},
 }
@@ -236,15 +236,15 @@ def parse_args(argv):
 
 def auto_provider():
     """Default provider = the first one whose API key is present in the env."""
-    for p in ("openrouter", "mistral", "zai"):
+    for p in ("openrouter", "zai"):
         if os.environ.get(PROVIDERS[p]["key_env"]):
             return p
     return None
 
 
 def resolve_cfg(args):
-    # 'mistral'/'openrouter'/... are PROVIDERS, not models — catch the common slip
-    # (e.g. `--model mistral` when you meant `--provider mistral`).
+    # 'zai'/'openrouter'/... are PROVIDERS, not models — catch the common slip
+    # (e.g. `--model zai` when you meant `--provider zai`).
     if args.model and args.model in PROVIDERS:
         sys.exit("'%s' is a PROVIDER, not a model — use: --provider %s" % (args.model, args.model))
 
@@ -254,7 +254,7 @@ def resolve_cfg(args):
     model = args.model or preset["default_model"]
     if not model:
         sys.exit("provider '%s' needs an explicit model. Examples:\n"
-                 "  --provider mistral                        # mistral-large-latest\n"
+                 "  --provider zai                            # glm-5.2\n"
                  "  --provider openrouter --model z-ai/glm-4.6\n"
                  "  --provider llamacpp  --model local        # local llama-server"
                  % provider)
@@ -349,7 +349,7 @@ def main():
                     break
                 nudges += 1
                 messages.append({"role": "user", "content":
-                    "Keep going until you have the answer/flag. Use the tools; "
+                    "Keep going until you have the answer. Use the tools; "
                     "do not stop mid-task. When truly finished, call browser_close "
                     "and give the final result."})
                 continue
@@ -373,6 +373,13 @@ def main():
                 # Isolate the traffic journal so parallel runs don't share one DB.
                 if fn["name"] == "browser_launch" and args.journal and "journal_db" not in args_obj:
                     args_obj["journal_db"] = args.journal
+                # MULOT_HEADLESS is the human's override (e.g. =false to watch the
+                # run). But the model routinely passes headless:true anyway — the
+                # tool desc and workflow nudge it — and an explicit arg beats the
+                # env var inside mulot. So when the env is set, drop the model's
+                # guess and let mulot's envcfg resolve MULOT_HEADLESS authoritatively.
+                if fn["name"] == "browser_launch" and os.environ.get("MULOT_HEADLESS"):
+                    args_obj.pop("headless", None)
                 if fn["name"] == "browser_close":
                     metrics["closed"] = True
 
