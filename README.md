@@ -9,18 +9,18 @@
 
 A local LLM GLM-5.2, Gemma or Qwen drives a real headless Chromium through a Burp-style toolkit and works a target the way a human pentester would. 
 
-No need for a frontier model using Kali VM
+No frontier model, no agent running inside a Kali VM.
 
 ![mulot solving OverTheWire natas16](bench/natas16.gif)
 
 <sub>recon → writes its own JavaScript payload → command injection → flag.</sub>
 
 Running only this harness, local GLM-5.2 agents solved **87% of OverTheWire Natas** and
-**73% of Root-Me Web-Server** full tables below.
+**73% of Root-Me Web-Server** (full tables below).
 
 - **Real browser, not just HTTP** real login flows, JS-heavy apps, and DOM-based XSS.
 - **Burp-shaped primitives** traffic history, repeater, intruder, passive scan.
-- **No frontier API, no agent-in-a-VM** Qwen 3.6 27B is workable GLM-5.2 is the sweet spot.
+- **No frontier API, no agent-in-a-VM** Qwen 3.6 27B is workable; GLM-5.2 is the sweet spot.
 
 ## The idea
 
@@ -49,7 +49,7 @@ mulot splits in two: a **proxy** that captures and replays every exchange, and a
 
 - **In-page JavaScript**: a JS toolbox run *inside* the page, not on the host. The
   agent automates from within, the machine that runs it stays out of reach. It injects
-  helper JS libraries into the DOM context and create its own javascript tools for padding-oracle attacks, time-based SQLi, deserialization...
+  helper JS libraries into the DOM context and creates its own JavaScript tools for padding-oracle attacks, time-based SQLi, deserialization...
 
 - **Embedded skills & wordlists**: playbooks and wordlists baked into the binary,
   served on demand by tag. Skills are picked after fingerprinting the target,
@@ -69,7 +69,7 @@ two tools:
 
 The flow: the model gets the shared workflow up front (so it knows its capabilities
 before it knows the target), **fingerprints** the target, then loads the matching
-stack. Polyglot targets are fine — call it again as more stacks surface. Adding a
+stack. Polyglot targets are fine; call it again as more stacks surface. Adding a
 stack means dropping an `assets/skills/<name>/` directory and rebuilding.
 
 ## Quick start
@@ -78,18 +78,18 @@ stack means dropping an `assets/skills/<name>/` directory and rebuilding.
 go build -o mulot ./cmd/mulot        # build the MCP server binary
 
 # local llama.cpp
-python3 agent.py  --provider llamacpp --model qwen3.6-mtp --base http://192.168.0.11:8080 \
+python3 agent.py  --provider llamacpp --model qwen3.6-mtp --base http://localhost:8080 \
   "pwn this server http://localhost:4280/login.php and output only id and uname -a command"
 
 # zai token
-export ZAI_API_KEY==...        
+export ZAI_API_KEY=...        
 python3 agent.py --provider zai --model glm-5.2 "audit http://localhost:8000"
 
 ```
 
 `agent.py` is a small single-file harness that drives mulot over stdio MCP and talks to
 any **OpenAI-compatible** endpoint with tool calling. Presets: `openrouter`, `llamacpp`,
-`zai` — the provider is auto-detected from whichever API key is in the environment.
+`zai`. The provider is auto-detected from whichever API key is in the environment.
 
 Environment variables:
 
@@ -103,9 +103,9 @@ Environment variables:
 
 Running local **GLM-5.2** agents against web pentest challenges using only this harness (max 120 steps) produced strong results:
 
-### OverTheWire (Natas) — 87% solved
+### OverTheWire (Natas): 87% solved
 
-<details><summary><b>Full results — 34 challenges</b></summary>
+<details><summary><b>Full results: 34 challenges</b></summary>
 
 | challenge | tech | pwned | error |
   |-|-|-|-|
@@ -142,13 +142,13 @@ Running local **GLM-5.2** agents against web pentest challenges using only this 
   natas30.natas.labs.overthewire.org | SQL Injection (Perl DBI `quote()` context confusion) | ✅ | 
   natas31.natas.labs.overthewire.org | Perl CGI magic-open / upload param confusion (unsolved) | ❌ | many attempts to abuse `<$file>` via a duplicated `file` param, no success in this session |
   natas32.natas.labs.overthewire.org | Perl CGI 2-arg `open()` pipe RCE (unsolved) | ❌ | same vuln class as natas29, command-piping attempts unsuccessful |
-  natas33.natas.labs.overthewire.org | Undetermined — session interrupted | ❌ | stopped after loading the PHP skill, no exploitation attempted |
+  natas33.natas.labs.overthewire.org | Undetermined (session interrupted) | ❌ | stopped after loading the PHP skill, no exploitation attempted |
 
 </details>
 
-### Root-Me (Web-Server) — 73% solved
+### Root-Me (Web-Server): 73% solved
 
-<details><summary><b>Full results — 92 challenges</b></summary>
+<details><summary><b>Full results: 92 challenges</b></summary>
 
 | challenge | tech | pwned | error |
   |-|-|-|-|
@@ -261,3 +261,7 @@ A lot of misses came from mulot's sandbox tooling that couldn't be rewritten in 
   | [Unserialize](bench/unserialize.sample.txt) | made its own JavaScript tool to craft a PHP serialized object |
   | [Upload](bench/upload.sample.txt) | test different image header while uploading |
   | [DVWA](bench/dvwa.qwen.sample.txt) | dvwa pwn with qwen |
+
+## Responsible use
+
+mulot is an offensive security tool for **authorized testing only**: systems you own, engagements you have written permission for, and deliberately vulnerable labs such as OverTheWire, Root-Me, or DVWA. It drives real attacks against whatever target you point it at, so aiming it at a system you do not own or are not explicitly authorized to test is likely illegal and is not a supported use case. You are responsible for staying within scope and within the law. Released under Apache-2.0, with no warranty.
