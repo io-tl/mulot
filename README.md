@@ -7,7 +7,7 @@
 
 > **Agentic AI web pentester that drives a browser.**
 
-A local LLM GLM-5.2, Gemma or Qwen drives a real headless Chromium through a Burp-style toolkit and works a target the way a human pentester would. 
+An open-weights LLM (GLM-5.2, Gemma or Qwen) drives a real headless Chromium through a Burp-style toolkit and works a target the way a human pentester would. 
 
 No frontier model, no agent running inside a Kali VM.
 
@@ -15,7 +15,7 @@ No frontier model, no agent running inside a Kali VM.
 
 <sub>recon → writes its own JavaScript payload → command injection → flag.</sub>
 
-Running only this harness, local GLM-5.2 agents solved **87% of OverTheWire Natas** and
+Running only this harness, open-weights GLM-5.2 agents solved **87% of OverTheWire Natas** and
 **73% of Root-Me Web-Server** (full tables below).
 
 - **Real browser, not just HTTP** real login flows, JS-heavy apps, and DOM-based XSS.
@@ -101,7 +101,7 @@ Environment variables:
 
 ## Results
 
-Running local **GLM-5.2** agents against web pentest challenges using only this harness (max 120 steps) produced strong results:
+Running open-weights **GLM-5.2** agents against web pentest challenges using only this harness (max 120 steps) produced strong results:
 
 ### OverTheWire (Natas): 87% solved
 
