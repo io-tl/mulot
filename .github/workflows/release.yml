@@ -1,0 +1,85 @@
+name: release
+
+# Cut a release by pushing a version tag:
+#   git tag v0.1.1 && git push origin v0.1.1
+# This cross-compiles the pure-Go MCP binary (no CGO — modernc sqlite + chromedp),
+# packages per-platform archives with a SHA256SUMS file, and publishes a GitHub
+# Release with auto-generated notes.
+
+on:
+  push:
+    tags:
+      - 'v*'
+
+permissions:
+  contents: write        # create the release and upload the built assets
+
+jobs:
+  build:
+    name: build ${{ matrix.goos }}/${{ matrix.goarch }}
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - { goos: linux,   goarch: amd64 }
+          - { goos: linux,   goarch: arm64 }
+          - { goos: darwin,  goarch: amd64 }
+          - { goos: darwin,  goarch: arm64 }
+          - { goos: windows, goarch: amd64 }
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod    # single source of truth for the Go version
+          check-latest: true
+
+      - name: build and package
+        env:
+          CGO_ENABLED: '0'
+          GOOS: ${{ matrix.goos }}
+          GOARCH: ${{ matrix.goarch }}
+        run: |
+          set -eu
+          bin=mulot
+          [ "$GOOS" = windows ] && bin=mulot.exe
+          go build -trimpath -ldflags "-s -w" -o "$bin" ./cmd/mulot
+
+          pkg="mulot_${GITHUB_REF_NAME}_${GOOS}_${GOARCH}"
+          if [ "$GOOS" = windows ]; then
+            zip -q "${pkg}.zip" "$bin" README.md LICENSE
+            echo "ASSET=${pkg}.zip" >> "$GITHUB_ENV"
+          else
+            tar czf "${pkg}.tar.gz" "$bin" README.md LICENSE
+            echo "ASSET=${pkg}.tar.gz" >> "$GITHUB_ENV"
+          fi
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: ${{ env.ASSET }}
+          path: ${{ env.ASSET }}
+          retention-days: 1
+
+  release:
+    name: publish release
+    needs: build
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          path: dist
+          merge-multiple: true       # flatten every matrix artifact into dist/
+
+      - name: checksums
+        run: |
+          cd dist
+          sha256sum mulot_* > SHA256SUMS
+          cat SHA256SUMS
+
+      - name: publish
+        uses: softprops/action-gh-release@v2
+        with:
+          files: dist/*
+          generate_release_notes: true
+          fail_on_unmatched_files: true
